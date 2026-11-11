@@ -16,10 +16,14 @@ export const MEMBER_IDS = Object.keys(FIXED);
 
 let cache = null;
 let cacheMtime = 0;
+let aliasLookup = () => [];
 
 export function slugify(name) {
   return String(name).toLowerCase().replace(/['’]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
+
+export function setAliasLookup(fn) { aliasLookup = fn || (() => []); }
+export function listStoredAliases() { return aliasLookup() || []; }
 
 function readConfig() {
   let mtime = 0;
@@ -47,24 +51,71 @@ export function isBot(id) { return FIXED[id]?.type === "bot"; }
 export function isHuman(id) { return FIXED[id]?.type === "human"; }
 export function botOf(ownerId) { return MEMBER_IDS.find((id) => FIXED[id].owner === ownerId) || null; }
 
-/** Resolve "Dylan", "dylan", "dylan_bot", "Dylan's Bot", "dylans-bot" -> member id. */
+export function reservedLabels(exceptId) {
+  const out = new Set();
+  for (const id of MEMBER_IDS) {
+    if (id === exceptId) continue;
+    const m = member(id);
+    const f = FIXED[id];
+    out.add(id);
+    out.add(m.name.toLowerCase());
+    out.add(m.handle);
+    out.add(f.defaultName.toLowerCase());
+    out.add(f.defaultHandle);
+  }
+  return out;
+}
+
+export function aliasesOf(id) {
+  const m = member(id);
+  if (!m) return [];
+  const cur = new Set([m.id, m.name.toLowerCase(), m.handle]);
+  const out = [];
+  const seen = new Set();
+  const add = (v) => {
+    const s = String(v || "").trim().toLowerCase();
+    if (!s || cur.has(s) || seen.has(s)) return;
+    seen.add(s);
+    out.push(s);
+  };
+  const f = FIXED[id];
+  if (f) { add(f.defaultName); add(f.defaultHandle); }
+  for (const a of listStoredAliases()) if (a.member_id === id) add(a.value);
+  return out;
+}
+
+export function publicMember(id) {
+  const m = member(id);
+  return m ? { ...m, aliases: aliasesOf(id) } : null;
+}
+
+/** Resolve current name/handle/id, the member's original name/handle, or a stored alias -> member id. */
 export function resolveMember(input) {
   if (!input) return null;
   const s = String(input).trim().toLowerCase();
   for (const m of listMembers()) {
+    const f = FIXED[m.id];
     if (s === m.id || s === m.name.toLowerCase() || s === m.handle) return m.id;
+    if (f && (s === f.defaultName.toLowerCase() || s === f.defaultHandle)) return m.id;
   }
+  for (const a of listStoredAliases()) if (a.value === s) return a.member_id;
   return null;
 }
 
-export function renameBot(id, newName) {
+export function validateBotName(id, newName) {
   if (!isBot(id)) throw new Error("Only bots can be renamed.");
   const name = String(newName || "").trim();
-  if (!name || name.length > 40 || /[:|\n\r]/.test(name)) throw new Error("Name must be 1-40 chars, no colons or newlines.");
+  if (!name || name.length > 40 || /[:|\n\r]/.test(name)) throw new Error("Name must be 1-40 chars, no colons, pipes or newlines.");
   const handle = slugify(name);
   if (!handle) throw new Error("Name needs at least one letter or digit.");
-  const clash = listMembers().find((m) => m.id !== id && (m.handle === handle || m.name.toLowerCase() === name.toLowerCase()));
-  if (clash) throw new Error("That name is already used by another member.");
+  const reserved = reservedLabels(id);
+  for (const a of listStoredAliases()) if (a.member_id !== id) reserved.add(a.value);
+  if (reserved.has(name.toLowerCase()) || reserved.has(handle)) throw new Error("That name is already used by another member.");
+  return { name, handle };
+}
+
+export function renameBot(id, newName) {
+  const { name, handle } = validateBotName(id, newName);
   let cfg = {};
   try { cfg = JSON.parse(readFileSync(CONFIG_PATH, "utf8")); } catch {}
   cfg[id] = { ...(cfg[id] || {}), name, handle };

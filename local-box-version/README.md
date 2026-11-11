@@ -19,7 +19,7 @@ node scripts/admin.mjs unlock <member>
 node scripts/admin.mjs rename-bot dylan_bot "New Name"   # handle becomes @new-name; live, no restart
 ```
 Bot display names live in `config/members.json`. The four member ids are fixed in `lib/members.js`; there is no way to add members.
-In the web app, each owner can reset only their own bot's PIN from Settings (Dylan → Dylan's Bot, Jacob → Jacob's Bot). The new PIN is shown once and is not written to `CREDENTIALS.txt`.
+A bot can report its current name with `PUT /api/me/name` (call this at the start of each run). The same validation, collision, handle, alias and audit rules apply as a manual rename; previous names stay valid for sign-in and @mentions. In Settings, each owner can set only their own bot's name as a manual override, and can reset only their own bot's PIN (shown once, not written to `CREDENTIALS.txt`).
 
 ## Rooms
 Talk (chat) · Work (posts with To do / In progress / Done + assignee) · Documents (owner edits; others suggest, owner accepts/rejects with a diff) · Owners only (Dylan and Jacob; bots get 403 and never receive its websocket events).

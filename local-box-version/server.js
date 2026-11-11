@@ -5,8 +5,8 @@ import cookieSession from "cookie-session";
 import { join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { writeFileSync, createReadStream, existsSync } from "node:fs";
-import { initDb, getDb, getSessionSecret, attemptLogin, memberRow, ROOT, FILES_DIR, resetOwnedBotPin, lastBotPinReset } from "./lib/db.js";
-import { member, listMembers, resolveMember, isBot, isHuman, botOf } from "./lib/members.js";
+import { initDb, getDb, getSessionSecret, attemptLogin, memberRow, ROOT, FILES_DIR, resetOwnedBotPin, lastBotPinReset, applyBotRename, lastBotRename, refreshCredentialNames } from "./lib/db.js";
+import { member, listMembers, resolveMember, isBot, isHuman, botOf, aliasesOf, publicMember } from "./lib/members.js";
 import { checkSensitive } from "./lib/filter.js";
 import { BOTS, deliver, newSecret, validateWebhookUrl, validateAuthHeader, noticesForMessage, noticesForReassign, noticesForSuggestion, noticesForDecision } from "./lib/webhooks.js";
 
@@ -159,7 +159,7 @@ function parseMentions(body) {
   const ids = new Set();
   for (const m of String(body).matchAll(/(^|[^\w@])@([a-z0-9][a-z0-9_-]*)/gi)) {
     const handle = m[2].toLowerCase().replace(/[-_]+$/, "");
-    const id = listMembers().find((x) => x.handle === handle || x.id === handle)?.id;
+    const id = resolveMember(handle);
     if (id) ids.add(id);
   }
   return [...ids];
@@ -244,10 +244,12 @@ api.get("/webhooks", (req, res) => {
   if (!hookGuard(req, res, false)) return;
   const bot = botOf(req.user.id);
   const last = bot && lastBotPinReset(bot);
+  const renamed = bot && lastBotRename(bot);
   res.json({
     webhooks: Object.keys(BOTS).map((b) => hookOut(b, req.user)),
-    myBot: bot ? { id: bot, name: member(bot).name } : null,
+    myBot: bot ? { id: bot, name: member(bot).name, handle: member(bot).handle, aliases: aliasesOf(bot) } : null,
     pinReset: last ? { at: last.at, actor: last.actor, actorName: member(last.actor)?.name, bot: last.subject } : null,
+    nameChange: renamed ? { at: renamed.at, actor: renamed.actor, actorName: member(renamed.actor)?.name || renamed.actor, bot: renamed.subject, source: renamed.source, name: renamed.name } : null,
   });
 });
 api.put("/webhooks/:bot", async (req, res) => {
@@ -322,13 +324,37 @@ api.post("/bot-pin/reset", (req, res) => {
   });
 });
 
+function namePayload(r) {
+  return { name: r.name, handle: r.handle, aliases: r.aliases, unchanged: !!r.unchanged, previous: r.previous, audit: r.audit || null };
+}
+function broadcastMembers() {
+  io.emit("members:update", listMembers().map((m) => publicMember(m.id)));
+}
+api.put("/me/name", (req, res) => {
+  if (!isBot(req.user.id)) return res.status(403).json({ error: "Only a bot can report its own name." });
+  const r = applyBotRename(req.user.id, req.body?.name, { actor: req.user.id, source: "self" });
+  if (!r.ok) return res.status(r.status).json({ error: r.error });
+  if (!r.unchanged) refreshCredentialNames();
+  broadcastMembers();
+  res.json(namePayload(r));
+});
+api.put("/bot/name", (req, res) => {
+  if (!isHuman(req.user.id)) return res.status(403).json({ error: "Only an owner can set their bot's name here." });
+  const bot = botOf(req.user.id);
+  if (!bot) return res.status(403).json({ error: "No bot is linked to this account." });
+  const r = applyBotRename(bot, req.body?.name, { actor: req.user.id, source: "owner" });
+  if (!r.ok) return res.status(r.status).json({ error: r.error });
+  if (!r.unchanged) refreshCredentialNames();
+  broadcastMembers();
+  res.json(namePayload(r));
+});
 api.get("/whoami", (req, res) => {
   const u = req.user;
-  res.json({ ...u, ownerName: u.owner ? member(u.owner).name : null,
+  res.json({ ...u, aliases: aliasesOf(u.id), ownerName: u.owner ? member(u.owner).name : null,
     canAccessOwnersRoom: isHuman(u.id),
     takesCommandsFrom: u.type === "bot" ? u.owner : null });
 });
-api.get("/members", (_req, res) => res.json({ members: listMembers() }));
+api.get("/members", (_req, res) => res.json({ members: listMembers().map((m) => publicMember(m.id)) }));
 api.get("/rooms", (req, res) => {
   res.json({ rooms: Object.values(ROOMS).filter((r) => !r.humansOnly || isHuman(req.user.id)) });
 });

@@ -19,7 +19,7 @@
 
   function renderBody(text) {
     return esc(text).replace(/(^|[^\w@])@([a-z0-9][a-z0-9_-]*)/gi, (m, pre, h) =>
-      state.members.some((x) => x.handle === h.toLowerCase() || x.id === h.toLowerCase()) ? `${pre}<span class="mention">@${h}</span>` : m);
+      state.members.some((x) => { const tok = h.toLowerCase(); return x.handle === tok || x.id === tok || (x.aliases || []).includes(tok); }) ? `${pre}<span class="mention">@${h}</span>` : m);
   }
 
   // ---------- login ----------
@@ -43,6 +43,16 @@
   });
   $("#logout").onclick = async () => { await api("/api/logout", { method: "POST" }); state.me = null; clearTimeout(pollTimer); showLogin(); };
 
+  function fillPeople() {
+    const pf = $("#people-filter"); const cur = pf.value;
+    pf.innerHTML = `<option value="">Everyone</option>` + state.members.map((m) => `<option value="${m.id}">${esc(m.name)}</option>`).join("");
+    if ([...pf.options].some((o) => o.value === cur)) pf.value = cur;
+  }
+  async function refreshMembers() {
+    state.members = (await api("/api/members")).members;
+    fillPeople();
+  }
+
   // ---------- app ----------
   async function boot() {
     const s = await api("/api/session");
@@ -52,8 +62,8 @@
     state.rooms = (await api("/api/rooms")).rooms;
     $("#login").classList.add("hidden"); $("#app").classList.remove("hidden");
     $("#me-name").textContent = state.me.name;
-    const pf = $("#people-filter"); pf.innerHTML = `<option value="">Everyone</option>` + state.members.map((m) => `<option value="${m.id}">${esc(m.name)}</option>`).join("");
-    pf.value = state.filter;
+    fillPeople();
+    $("#people-filter").value = state.filter;
     if (!state.rooms.some((r) => r.id === state.room)) state.room = "talk";
     renderNav(); openRoom(state.room);
   }
@@ -202,8 +212,9 @@
 
   // ---------- settings: bot webhooks (humans only) ----------
   async function openSettings() {
+    try { await refreshMembers(); } catch {}
     state.room = "settings"; state.editing = false; renderNav(); $("#transcript-link").classList.add("hidden"); $("#toast").classList.add("hidden");
-    $("#room-title").textContent = "Settings"; $("#room-desc").textContent = "Bot webhooks and your bot's PIN.";
+    $("#room-title").textContent = "Settings"; $("#room-desc").textContent = "Your bot's name, webhooks, and PIN.";
     let data;
     try { data = await api("/api/webhooks"); } catch (err) { $("#view").innerHTML = `<p class="empty">${esc(err.message)}</p>`; return; }
     const card = (w) => `<section class="sugg" data-bot="${w.botId}">
@@ -223,6 +234,16 @@
             <button class="danger small" data-act="clear-auth" ${w.authHeader?.set ? "" : "disabled"}>Clear header</button>
           </div>` : `<p class="muted">Only ${esc(w.managedByName)} can change this.${w.authHeader?.set ? " Custom auth header: set." : " Custom auth header: not set."}</p>`}
       </section>`;
+    const nameCard = data.myBot ? `<section class="sugg" id="bot-name">
+        <h3>My bot's name</h3>
+        <p class="muted">The workspace follows the name your bot reports with <code>PUT /api/me/name</code>. You can also set it here as a manual override. Current: <b>${esc(data.myBot.name)}</b> (@${esc(data.myBot.handle)}).</p>
+        ${data.nameChange ? `<p class="muted">Last changed ${fmtTime(data.nameChange.at)} by ${esc(data.nameChange.actorName)}${data.nameChange.name ? " to " + esc(data.nameChange.name) : ""}.</p>` : ""}
+        <div class="row" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+          <input id="bot-name-input" style="flex:1;min-width:160px" maxlength="40" value="${esc(data.myBot.name)}" placeholder="Bot name">
+          <button class="brass small" id="save-bot-name">Save name</button>
+        </div>
+        <p class="muted" id="bot-name-msg"></p>
+      </section>` : "";
     const pinCard = data.myBot ? `<section class="sugg" id="bot-pin">
         <h3>Reset my bot's PIN</h3>
         <p class="muted">This makes a new PIN for <b>${esc(data.myBot.name)}</b> only. The current PIN stops working immediately. You'll see the new one once — copy it now.</p>
@@ -245,6 +266,7 @@
       </div>
       <p class="muted">Notices are sent for: @mentions and bot handoffs, Work posts assigned to the bot, suggestions on the bot's docs (and decisions on its suggestions), and any message from Dylan or Jacob. Never for Owners only, never for the bot's own actions. Payload: <code>{type, room, itemId, author, time}</code>, no message text.</p>
       ${data.webhooks.map(card).join("")}
+      ${nameCard}
       ${pinCard}</div>`;
     document.querySelectorAll("#settings [data-act]").forEach((b) => b.onclick = async () => {
       const sec = b.closest("[data-bot]"), bot = sec.dataset.bot;
@@ -270,6 +292,19 @@
         }
       } catch (err) { toast(err.message, true); }
     });
+    const saveName = $("#save-bot-name"), nameInput = $("#bot-name-input");
+    if (saveName) {
+      saveName.onclick = async () => {
+        try {
+          const r = await api("/api/bot/name", { method: "PUT", body: JSON.stringify({ name: nameInput.value }) });
+          toast(r.unchanged ? "Name is already current." : `Name saved: ${r.name} (@${r.handle}).`);
+          const mine = state.members.find((m) => m.id === data.myBot.id);
+          if (mine) { mine.name = r.name; mine.handle = r.handle; mine.aliases = r.aliases || []; }
+          fillPeople();
+          openSettings();
+        } catch (err) { toast(err.message, true); }
+      };
+    }
     const resetBtn = $("#reset-bot-pin"), cancelBtn = $("#cancel-bot-pin"), pinOut = $("#new-bot-pin");
     if (resetBtn) {
       let pending = false;

@@ -14,3 +14,7 @@ node_modules/
 .admin-secret*
 .sink-token*
 .bypass-secret*
+
+# editor lockfiles and any credentials artifacts
+.~lock.*
+*CREDENTIALS*

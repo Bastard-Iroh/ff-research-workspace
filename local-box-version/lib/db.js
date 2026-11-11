@@ -3,7 +3,7 @@ import { mkdirSync, existsSync, writeFileSync, readFileSync, chmodSync } from "n
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes, randomInt, scryptSync, timingSafeEqual } from "node:crypto";
-import { MEMBER_IDS, member, isBot, isHuman, botOf } from "./members.js";
+import { MEMBER_IDS, member, isBot, isHuman, botOf, validateBotName, renameBot, setAliasLookup, aliasesOf } from "./members.js";
 
 export const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const DATA_DIR = process.env.FFW_DATA_DIR || join(ROOT, "data");
@@ -119,6 +119,13 @@ export function initDb() {
       at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_audit_type_subject ON audit_events(type, subject, id);
+    CREATE TABLE IF NOT EXISTS name_aliases (
+      member_id TEXT NOT NULL,
+      value TEXT NOT NULL,
+      at INTEGER NOT NULL,
+      PRIMARY KEY (member_id, value)
+    );
+    CREATE INDEX IF NOT EXISTS idx_alias_value ON name_aliases(value);
   `);
   // Permanent record: make sure every existing doc has at least its current version saved.
   db.exec(`INSERT INTO doc_versions (doc_id, version, title, body, author, source, at)
@@ -128,6 +135,8 @@ export function initDb() {
   for (const col of ["auth_header_name", "auth_header_value"]) {
     try { db.exec(`ALTER TABLE webhooks ADD COLUMN ${col} TEXT`); } catch {}
   }
+  try { db.exec("ALTER TABLE audit_events ADD COLUMN detail TEXT"); } catch {}
+  setAliasLookup(() => db.prepare("SELECT member_id, value FROM name_aliases").all());
 }
 
 export function getSessionSecret() {
@@ -216,6 +225,43 @@ export function resetOwnedBotPin(actorId) {
 
 export function lastBotPinReset(botId) {
   return db.prepare("SELECT actor, subject, at FROM audit_events WHERE type = 'bot_pin_reset' AND subject = ? ORDER BY id DESC LIMIT 1").get(botId) || null;
+}
+
+function parseDetail(row) {
+  if (!row) return null;
+  let detail = null;
+  try { detail = row.detail ? JSON.parse(row.detail) : null; } catch {}
+  return { actor: row.actor, subject: row.subject, at: row.at, source: detail?.source || null, oldName: detail?.oldName, oldHandle: detail?.oldHandle, name: detail?.name, handle: detail?.handle };
+}
+
+export function lastBotRename(botId) {
+  return parseDetail(db.prepare("SELECT actor, subject, at, detail FROM audit_events WHERE type = 'bot_rename' AND subject = ? ORDER BY id DESC LIMIT 1").get(botId));
+}
+
+/** Apply a validated bot rename, keep previous names as aliases, and write an audit row (no secrets). */
+export function applyBotRename(id, newName, { actor, source } = {}) {
+  if (!isBot(id)) return { ok: false, status: 400, error: "Only bots can be renamed." };
+  const current = member(id);
+  let v;
+  try { v = validateBotName(id, newName); }
+  catch (e) {
+    return { ok: false, status: /already used/.test(e.message) ? 409 : 400, error: e.message };
+  }
+  if (current.name === v.name && current.handle === v.handle) {
+    return { ok: true, unchanged: true, name: v.name, handle: v.handle, aliases: aliasesOf(id), previous: { name: current.name, handle: current.handle } };
+  }
+  renameBot(id, v.name);
+  const now = Date.now();
+  for (const val of [current.name, current.handle]) {
+    const s = String(val).toLowerCase();
+    if (s && s !== v.name.toLowerCase() && s !== v.handle) {
+      db.prepare("INSERT OR IGNORE INTO name_aliases (member_id, value, at) VALUES (?, ?, ?)").run(id, s, now);
+    }
+  }
+  db.prepare("DELETE FROM name_aliases WHERE member_id = ? AND (value = ? OR value = ?)").run(id, v.name.toLowerCase(), v.handle);
+  const detail = JSON.stringify({ source: source || "unknown", oldName: current.name, oldHandle: current.handle, name: v.name, handle: v.handle });
+  db.prepare("INSERT INTO audit_events (type, actor, subject, at, detail) VALUES ('bot_rename', ?, ?, ?, ?)").run(actor || "unknown", id, now, detail);
+  return { ok: true, unchanged: false, name: v.name, handle: v.handle, aliases: aliasesOf(id), previous: { name: current.name, handle: current.handle }, audit: { actor: actor || "unknown", subject: id, at: now, source: source || "unknown" } };
 }
 export function unlock(id) {
   db.prepare("UPDATE members SET failed = 0, locked_until = 0 WHERE id = ?").run(id);

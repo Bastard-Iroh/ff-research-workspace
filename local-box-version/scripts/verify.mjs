@@ -8,6 +8,7 @@ import { runWebhookTests } from "./verify-webhooks.mjs";
 import { runPermanentTests } from "./verify-permanent.mjs";
 import { runBotPinTests } from "./verify-bot-pin.mjs";
 import { runJacobWebhookUiTests } from "./verify-jacob-webhook-ui.mjs";
+import { runBotNameTests } from "./verify-bot-name.mjs";
 import { io as ioClient } from "socket.io-client";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -244,6 +245,11 @@ await runPermanentTests({ call, dylanS, jacobS, check, tag });
   C = credsRef.C;
 }
 
+// ---------- bot self-name + owner override ----------
+{
+  await runBotNameTests({ call, human: { dylan: dylanS, jacob: jacobS }, check, pin: (id) => C[id] });
+}
+
 // ---------- browser UI ----------
 const browser = await puppeteer.launch({ executablePath: CHROME, args: ["--no-sandbox"] });
 async function uiLogin(page, id, pin) {
@@ -380,6 +386,9 @@ try {
   const pinBtn = await pd.$("#reset-bot-pin");
   const pinLabel = pinBtn && await pd.$eval("#bot-pin", (e) => e.innerText);
   check("UI: Settings shows Dylan a Reset my bot's PIN button for Dylan's Bot", !!pinBtn && /Dylan's Bot/.test(pinLabel || "") && /Reset my bot's PIN/.test(pinLabel || ""));
+  const nameInput = await pd.$("#bot-name-input");
+  const nameCard = nameInput && await pd.$eval("#bot-name", (e) => e.innerText);
+  check("UI: Settings shows Dylan a name field for his own bot", !!nameInput && /My bot's name/.test(nameCard || "") && /Dylan's Bot/.test(nameCard || "") && /PUT \/api\/me\/name/.test(nameCard || ""));
   await pd.click("#reset-bot-pin");
   const confirmLabel = await pd.$eval("#reset-bot-pin", (e) => e.textContent);
   const cancelVisible = await pd.$eval("#cancel-bot-pin", (e) => !e.classList.contains("hidden"));

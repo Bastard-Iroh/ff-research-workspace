@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-11-11: Bot self-naming (`PUT /api/me/name`)
+- **Bot-reported name:** a bot can call `PUT /api/me/name` with `{"name":"..."}` to report the name it uses outside the app. The same validation, collision rules, handle derivation, alias list and audit log apply as a manual rename. Call it at the start of each run so the workspace stays in sync. Only that bot can use the endpoint (humans get 403); there is no target that would let a person or the other bot change this name through it.
+- **Aliases:** previous display names and handles stay valid for sign-in and `@mentions`, along with the original default name and handle. The member id never changes.
+- **Owner override:** in Settings, each owner can still set only their own bot's name (`PUT /api/bot/name`). The admin CLI rename continues to work and now writes the same aliases and audit row.
+- **Testing:** checks run only on a box test copy and the Vercel Preview test database. Production received read-only checks only; no live bot was renamed.
+
 ## 2026-11-11: Own-bot PIN reset, webhook auth header, Settings setup help
 - **Reset my bot's PIN:** in Settings, each signed-in owner can regenerate only their own bot's PIN (Dylan → Dylan's Bot, Jacob → Jacob's Bot). The server picks the bot from the signed-in account; there is no target a client can change. Bots get 403, and an attempt to name the other bot is 403. A new PIN is generated in the same format as before, stored only as a scrypt hash, shown once with a copy button, and never logged or saved in plaintext. That bot's lockout is cleared and its existing sessions stop working immediately. The reset (who, which bot, when — never the PIN) is written to an append-only audit log.
 - **Custom webhook auth header:** each bot's owner can save an optional header name and secret in their own bot's webhook settings. It is sent with every notice, including tests, so a receiver that requires a sender key can accept the notice. After save, Settings shows only set or not set (plus the header name to the owner) and a Clear header button; the value is never shown again or logged. Reserved and hop-by-hop names (`Host`, `Content-Length`, `Content-Type`, `Connection`, `Transfer-Encoding`, `Cookie`, and similar) are rejected, and header names are limited to safe characters.

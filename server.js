@@ -6,8 +6,8 @@ import { Readable } from "node:stream";
 import { readFileSync } from "node:fs";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { put, get as blobGet, del as blobDel } from "@vercel/blob";
-import { q, one, nums, attemptLogin, memberRow, SCHEMA, resetOwnedBotPin, lastBotPinReset, ensureHookCols } from "./lib/db.js";
-import { member, listMembers, resolveMember, isBot, isHuman, botOf, refreshNames, validateBotName, MEMBER_IDS } from "./lib/members.js";
+import { q, one, nums, attemptLogin, memberRow, SCHEMA, resetOwnedBotPin, lastBotPinReset, ensureHookCols, applyBotRename, lastBotRename, ensureRenameSupport } from "./lib/db.js";
+import { member, listMembers, resolveMember, isBot, isHuman, botOf, refreshNames, validateBotName, MEMBER_IDS, aliasesOf, publicMember } from "./lib/members.js";
 import { checkSensitive } from "./lib/filter.js";
 import { waitUntil } from "@vercel/functions";
 import { BOTS, deliver, newSecret, validateWebhookUrl, validateAuthHeader, noticesForMessage, noticesForReassign, noticesForSuggestion, noticesForDecision } from "./lib/webhooks.js";
@@ -70,6 +70,7 @@ function parseAuthHeader(h) {
   return { name: raw.slice(0, i), pin: raw.slice(i + 1) };
 }
 async function authenticate(req) {
+  await ensureRenameSupport();
   await refreshNames(q);
   const h = req.headers.authorization;
   if (h) {
@@ -154,7 +155,7 @@ function parseMentions(body) {
   const ids = new Set();
   for (const m of String(body).matchAll(/(^|[^\w@])@([a-z0-9][a-z0-9_-]*)/gi)) {
     const handle = m[2].toLowerCase().replace(/[-_]+$/, "");
-    const id = listMembers().find((x) => x.handle === handle || x.id === handle)?.id;
+    const id = resolveMember(handle);
     if (id) ids.add(id);
   }
   return [...ids];
@@ -261,11 +262,9 @@ api.post("/admin", wrap(async (req, res) => {
       await q("UPDATE members SET pin_hash = $1, pin_version = pin_version + 1, failed = 0, locked_until = 0 WHERE id = $2", [pinHash, id]);
       return res.json({ ok: true });
     case "rename-bot": {
-      await refreshNames(q, true);
-      const v = validateBotName(id, name);
-      await q("UPDATE members SET name = $1, handle = $2 WHERE id = $3", [v.name, v.handle, id]);
-      await refreshNames(q, true);
-      return res.json({ ok: true, ...v });
+      const r = await applyBotRename(id, name, { actor: "admin", source: "admin" });
+      if (!r.ok) return res.status(r.status).json({ error: r.error });
+      return res.json({ ok: true, name: r.name, handle: r.handle, unchanged: r.unchanged });
     }
     case "export":
       return res.json({ messages: await q("SELECT * FROM messages ORDER BY id"), files: await q("SELECT * FROM files ORDER BY id"),
@@ -330,13 +329,17 @@ function hookGuard(req, res, write) {
 api.get("/webhooks", wrap(async (req, res) => {
   if (!hookGuard(req, res, false)) return;
   await ensureHookCols();
+  await ensureRenameSupport();
+  await refreshNames(q, true);
   const rows = (await q("SELECT * FROM webhooks")).map(nums);
   const bot = botOf(req.user.id);
   const last = bot && await lastBotPinReset(bot);
+  const renamed = bot && await lastBotRename(bot);
   res.json({
     webhooks: await Promise.all(Object.keys(BOTS).map((b) => hookOut(b, req.user, rows.find((r) => r.bot_id === b) || {}))),
-    myBot: bot ? { id: bot, name: member(bot).name } : null,
+    myBot: bot ? { id: bot, name: member(bot).name, handle: member(bot).handle, aliases: aliasesOf(bot) } : null,
     pinReset: last ? { at: last.at, actor: last.actor, actorName: member(last.actor)?.name, bot: last.subject } : null,
+    nameChange: renamed ? { at: renamed.at, actor: renamed.actor, actorName: member(renamed.actor)?.name || renamed.actor, bot: renamed.subject, source: renamed.source, name: renamed.name } : null,
   });
 }));
 api.put("/webhooks/:bot", wrap(async (req, res) => {
@@ -407,11 +410,28 @@ api.post("/bot-pin/reset", wrap(async (req, res) => {
   });
 }));
 
+function namePayload(r) {
+  return { name: r.name, handle: r.handle, aliases: r.aliases, unchanged: !!r.unchanged, previous: r.previous, audit: r.audit || null };
+}
+api.put("/me/name", wrap(async (req, res) => {
+  if (!isBot(req.user.id)) return res.status(403).json({ error: "Only a bot can report its own name." });
+  const r = await applyBotRename(req.user.id, req.body?.name, { actor: req.user.id, source: "self" });
+  if (!r.ok) return res.status(r.status).json({ error: r.error });
+  res.json(namePayload(r));
+}));
+api.put("/bot/name", wrap(async (req, res) => {
+  if (!isHuman(req.user.id)) return res.status(403).json({ error: "Only an owner can set their bot's name here." });
+  const bot = botOf(req.user.id);
+  if (!bot) return res.status(403).json({ error: "No bot is linked to this account." });
+  const r = await applyBotRename(bot, req.body?.name, { actor: req.user.id, source: "owner" });
+  if (!r.ok) return res.status(r.status).json({ error: r.error });
+  res.json(namePayload(r));
+}));
 api.get("/whoami", (req, res) => {
   const u = req.user;
-  res.json({ ...u, ownerName: u.owner ? member(u.owner).name : null, canAccessOwnersRoom: isHuman(u.id), takesCommandsFrom: u.type === "bot" ? ["dylan", "jacob", u.id === "dylan_bot" ? "jacob_bot" : "dylan_bot"] : null });
+  res.json({ ...u, aliases: aliasesOf(u.id), ownerName: u.owner ? member(u.owner).name : null, canAccessOwnersRoom: isHuman(u.id), takesCommandsFrom: u.type === "bot" ? ["dylan", "jacob", u.id === "dylan_bot" ? "jacob_bot" : "dylan_bot"] : null });
 });
-api.get("/members", (_req, res) => res.json({ members: listMembers() }));
+api.get("/members", (_req, res) => res.json({ members: listMembers().map((m) => publicMember(m.id)) }));
 api.get("/rooms", (req, res) => res.json({ rooms: Object.values(ROOMS).filter((r) => !r.humansOnly || isHuman(req.user.id)) }));
 
 api.get("/rooms/:room/messages", wrap(async (req, res) => {

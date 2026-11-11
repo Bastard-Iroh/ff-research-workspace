@@ -4,8 +4,8 @@
 //   node scripts/admin.mjs reset-pin <member>      (dylan | jacob | dylan_bot | jacob_bot | display name)
 //   node scripts/admin.mjs unlock <member>
 //   node scripts/admin.mjs rename-bot <bot> "New Name"
-import { initDb, resetPin, unlock, memberRow, refreshCredentialNames } from "../lib/db.js";
-import { listMembers, resolveMember, renameBot, isBot } from "../lib/members.js";
+import { initDb, resetPin, unlock, memberRow, refreshCredentialNames, applyBotRename } from "../lib/db.js";
+import { listMembers, resolveMember, isBot } from "../lib/members.js";
 
 const [cmd, who, ...rest] = process.argv.slice(2);
 initDb();
@@ -30,8 +30,10 @@ switch (cmd) {
   case "rename-bot": {
     need();
     if (!isBot(id)) { console.error("Only bots can be renamed."); process.exit(1); }
-    try { const m = renameBot(id, rest.join(" ")); refreshCredentialNames(); console.log(`${id} is now "${m.name}" (@${m.handle}). Running server picks this up automatically.`); }
-    catch (e) { console.error(e.message); process.exit(1); }
+    const r = applyBotRename(id, rest.join(" "), { actor: "admin", source: "admin" });
+    if (!r.ok) { console.error(r.error); process.exit(1); }
+    refreshCredentialNames();
+    console.log(`${id} is now "${r.name}" (@${r.handle}). Running server picks this up automatically.`);
     break;
   }
   default:
