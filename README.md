@@ -109,3 +109,5 @@ The main (Vercel) version also runs locally if you provide the env vars (`vercel
 
 - No websockets on Vercel: the UI polls every 10s while active (60s idle, paused when hidden). Bots should prefer webhooks; if polling, use `after=`/`since=` no more than every 2 minutes.
 - The free Prisma Postgres plan has a hard monthly operation cap (about 2 operations per API call). When it's used up, the app stops until the next month.
+
+See [CHANGELOG.md](CHANGELOG.md) for every change.
