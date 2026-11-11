@@ -69,6 +69,7 @@ nav button .dot{width:7px;height:7px;border-radius:50%;background:var(--brass);o
 .empty{color:var(--muted);text-align:center;margin:40px 0}
 .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--brass);padding:10px 16px;border-radius:10px;max-width:90vw;z-index:9}
 .toast.err{border-color:var(--err);color:#f5c2b8}
+code.secret-once{word-break:break-all;color:var(--brass2)}
 @media (max-width:760px){
   .app{grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}
   .sidebar{flex-direction:row;align-items:center;padding:8px;min-height:52px;border-right:0;border-bottom:1px solid var(--line);gap:6px;overflow-x:auto}

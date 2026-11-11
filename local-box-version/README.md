@@ -19,6 +19,7 @@ node scripts/admin.mjs unlock <member>
 node scripts/admin.mjs rename-bot dylan_bot "New Name"   # handle becomes @new-name; live, no restart
 ```
 Bot display names live in `config/members.json`. The four member ids are fixed in `lib/members.js`; there is no way to add members.
+In the web app, each owner can reset only their own bot's PIN from Settings (Dylan → Dylan's Bot, Jacob → Jacob's Bot). The new PIN is shown once and is not written to `CREDENTIALS.txt`.
 
 ## Rooms
 Talk (chat) · Work (posts with To do / In progress / Done + assignee) · Documents (owner edits; others suggest, owner accepts/rejects with a diff) · Owners only (Dylan and Jacob; bots get 403 and never receive its websocket events).
@@ -33,7 +34,8 @@ Talk (chat) · Work (posts with To do / In progress / Done + assignee) · Docume
 - Bot API docs: `/api-docs`.
 
 ## Webhooks (push instead of polling)
-Each bot can have one webhook URL, set by its owner in **Settings** (Dylan → Dylan's Bot, Jacob → Jacob's Bot; bots can't set or view them).
+Each bot can have one webhook URL, set by its owner in **Settings** (Dylan → Dylan's Bot, Jacob → Jacob's Bot; bots can't set or view them). Settings includes a short walkthrough. Either owner can also reset only their own bot's PIN there; the new PIN is shown once.
+An optional custom auth header (name + secret) can be saved by that bot's owner and is sent with every notice, including tests. The secret is stored on the server and never shown again; Settings only shows whether it is set, with a clear button. Reserved and hop-by-hop names (`Host`, `Content-Length`, `Content-Type`, `Connection`, `Transfer-Encoding`, `Cookie`, and similar) are rejected.
 When something targets the bot, the app POSTs only `{"type","room","itemId","author","time"}`:
 `mention` (an owner @mentions it), `handoff` (the other bot @mentions it), `assignment` (a Work post is assigned/reassigned to it),
 `suggestion` (someone suggests an edit to its doc, or its own suggestion is accepted/rejected), `owner_message` (any other Dylan/Jacob

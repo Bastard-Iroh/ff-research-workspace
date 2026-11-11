@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import puppeteer from "puppeteer-core";
 import { runWebhookTests } from "./verify-webhooks.mjs";
 import { runPermanentTests } from "./verify-permanent.mjs";
+import { runBotPinTests } from "./verify-bot-pin.mjs";
+import { runJacobWebhookUiTests } from "./verify-jacob-webhook-ui.mjs";
 import { io as ioClient } from "socket.io-client";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -220,13 +222,26 @@ await runPermanentTests({ call, dylanS, jacobS, check, tag });
 {
   const http = await import("node:http");
   const inbox = [];
-  const srv = http.createServer((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { inbox.push({ bot: new URL(req.url, "http://x").searchParams.get("bot"), body: b, sig: req.headers["x-ffw-signature"] }); res.writeHead(204).end(); }); });
+  const srv = http.createServer((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { inbox.push({ bot: new URL(req.url, "http://x").searchParams.get("bot"), body: b, sig: req.headers["x-ffw-signature"], headers: req.headers }); res.writeHead(204).end(); }); });
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
   const port = srv.address().port;
   const receiver = { url: (bot) => `http://127.0.0.1:${port}/hook?bot=${bot}`, read: async () => [...inbox], clear: async () => { inbox.length = 0; } };
   const badUrls = ["https://10.0.0.1/hook", "https://192.168.1.10/hook", "https://169.254.169.254/latest/meta-data", "https://metadata.google.internal/", "http://example.com/hook", "ftp://example.com/x", "https://[::ffff:7f00:1]/hook", "https://[fd00::1]/hook"];
   globalThis.webhookResults = await runWebhookTests({ call, human: { dylan: dylanS, jacob: jacobS }, check, sleep, receiver, badUrls, tag });
   srv.close();
+}
+
+
+// ---------- in-app bot PIN reset (each owner, own bot only) ----------
+{
+  const sessionForWithPin = async (id, pin) => {
+    const r = await fetch(BASE + "/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ member: id, pin }) });
+    const cookie = r.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+    return { fetch: (method, path, body, h = {}) => fetch(BASE + path, { method, headers: { Cookie: cookie, "X-FFW": "1", ...(body && !(body instanceof Buffer) ? { "Content-Type": "application/json" } : {}), ...h }, body: body instanceof Buffer ? body : body && JSON.stringify(body) }).then(async (x) => ({ status: x.status, data: await x.json().catch(() => null) })) };
+  };
+  const credsRef = { C };
+  await runBotPinTests({ call, human: { dylan: dylanS, jacob: jacobS }, check, credsRef, basic, sessionLogin: sessionForWithPin });
+  C = credsRef.C;
 }
 
 // ---------- browser UI ----------
@@ -360,7 +375,33 @@ try {
   const dylanCard = await pd.$eval('#settings [data-bot="dylan_bot"]', (e) => !!e.querySelector(".hook-url"));
   const jacobCard = await pd.$eval('#settings [data-bot="jacob_bot"]', (e) => e.innerText);
   check("UI: Settings shows Dylan an editable webhook for Dylan's Bot only", editable === 1 && dylanCard && /Only Jacob can change this/.test(jacobCard));
+  const helpD = await pd.$eval("#hook-help", (e) => e.innerText).catch(() => "");
+  check("UI: Settings help note is visible to Dylan", /Save header/.test(helpD) && /Send test/.test(helpD) && /your bot's webhook/.test(helpD));
+  const pinBtn = await pd.$("#reset-bot-pin");
+  const pinLabel = pinBtn && await pd.$eval("#bot-pin", (e) => e.innerText);
+  check("UI: Settings shows Dylan a Reset my bot's PIN button for Dylan's Bot", !!pinBtn && /Dylan's Bot/.test(pinLabel || "") && /Reset my bot's PIN/.test(pinLabel || ""));
+  await pd.click("#reset-bot-pin");
+  const confirmLabel = await pd.$eval("#reset-bot-pin", (e) => e.textContent);
+  const cancelVisible = await pd.$eval("#cancel-bot-pin", (e) => !e.classList.contains("hidden"));
+  check("UI: Reset my bot's PIN asks for confirm before changing anything", /Confirm reset/.test(confirmLabel) && cancelVisible);
+  await pd.click("#cancel-bot-pin");
+  const afterCancel = await pd.$eval("#reset-bot-pin", (e) => e.textContent);
+  const pinRevealed = await pd.$("#bot-pin-value");
+  check("UI: cancel leaves the current bot PIN unchanged (no PIN shown)", afterCancel === "Reset my bot's PIN" && !pinRevealed);
   await pd.screenshot({ path: join(SHOTS, "desktop-settings.png") });
+
+  // Jacob sets up his own bot's webhook entirely in Settings (URL, auth header, test, clear)
+  {
+    const http = await import("node:http");
+    const inbox = [];
+    const srv = http.createServer((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { inbox.push({ bot: new URL(req.url, "http://x").searchParams.get("bot"), body: b, sig: req.headers["x-ffw-signature"], headers: req.headers }); res.writeHead(204).end(); }); });
+    await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+    const port = srv.address().port;
+    try {
+      await runJacobWebhookUiTests({ page: pj, check, clickJs, sleep, tag, receiverUrl: `http://127.0.0.1:${port}/hook?bot=jacob_bot`, readInbox: async () => [...inbox], clearInbox: async () => { inbox.length = 0; } });
+      await pj.screenshot({ path: join(SHOTS, "desktop-settings-jacob.png") });
+    } finally { srv.close(); }
+  }
 
   // mobile
   const pm = await ctxD.newPage();

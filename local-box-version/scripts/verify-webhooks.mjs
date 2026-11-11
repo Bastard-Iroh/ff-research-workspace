@@ -26,7 +26,9 @@ export async function runWebhookTests(ctx) {
     const otherSet = await human[other].fetch("PUT", `/api/webhooks/${bot}`, { url: receiver.url(bot) });
     const otherDel = await human[other].fetch("DELETE", `/api/webhooks/${bot}`);
     const otherTest = await human[other].fetch("POST", `/api/webhooks/${bot}/test`);
-    rec(bot, `other owner (${other}) can't set, clear or test it (403)`, otherSet.status === 403 && otherDel.status === 403 && otherTest.status === 403);
+    const otherAuth = await human[other].fetch("PUT", `/api/webhooks/${bot}/auth-header`, { name: "X-Sender-Key", value: "nope" });
+    const otherAuthDel = await human[other].fetch("DELETE", `/api/webhooks/${bot}/auth-header`);
+    rec(bot, `other owner (${other}) can't set, clear, test or change the auth header (403)`, otherSet.status === 403 && otherDel.status === 403 && otherTest.status === 403 && otherAuth.status === 403 && otherAuthDel.status === 403);
     const view = await human[other].fetch("GET", "/api/webhooks");
     const v = view.data.webhooks.find((w) => w.botId === bot);
     rec(bot, "other owner sees 'set' but not the URL", v.configured === true && v.url === null && v.canEdit === false);
@@ -34,13 +36,40 @@ export async function runWebhookTests(ctx) {
     const b2 = await call(OTHER_BOT[bot], "PUT", `/api/webhooks/${bot}`, { url: receiver.url(bot) });
     const b3 = await call(bot, "GET", "/api/webhooks");
     const b4 = await call(bot, "POST", `/api/webhooks/${bot}/test`);
-    rec(bot, "bots can't view, set or test webhooks (403)", b1.status === 403 && b2.status === 403 && b3.status === 403 && b4.status === 403);
+    const b5 = await call(bot, "PUT", `/api/webhooks/${bot}/auth-header`, { name: "X-Sender-Key", value: "nope" });
+    const b6 = await call(bot, "DELETE", `/api/webhooks/${bot}/auth-header`);
+    rec(bot, "bots can't view, set, test or change the auth header (403)", b1.status === 403 && b2.status === 403 && b3.status === 403 && b4.status === 403 && b5.status === 403 && b6.status === 403);
     for (const u of ctx.badUrls) {
       const r = await human[mgr].fetch("PUT", `/api/webhooks/${bot}`, { url: u });
       rec(bot, `SSRF/scheme guard rejects ${u}`, r.status === 400 && r.data.code === "bad_webhook_url", r.data?.error);
     }
     const still = (await human[mgr].fetch("GET", "/api/webhooks")).data.webhooks.find((w) => w.botId === bot);
     rec(bot, "rejected URL didn't replace the saved one", still.url === receiver.url(bot));
+
+    const authVal = `ffwtest_${bot}_${tag}`;
+    const authOk = await human[mgr].fetch("PUT", `/api/webhooks/${bot}/auth-header`, { name: "X-Sender-Key", value: authVal });
+    const listed = (await human[mgr].fetch("GET", "/api/webhooks")).data;
+    const me = listed.webhooks.find((w) => w.botId === bot);
+    const leaked = JSON.stringify(listed).includes(authVal) || "value" in (me.authHeader || {});
+    rec(bot, "manager sets custom auth header; value is not returned", authOk.status === 200 && me.authHeader?.set === true && me.authHeader?.name === "X-Sender-Key" && !leaked);
+    const otherView = (await human[other].fetch("GET", "/api/webhooks")).data.webhooks.find((w) => w.botId === bot);
+    rec(bot, "other owner sees auth header as set, not the name or value", otherView.authHeader?.set === true && otherView.authHeader?.name == null && !JSON.stringify(otherView).includes(authVal));
+    const blocked = ["Host", "Content-Length", "Content-Type", "Connection", "Transfer-Encoding", "Cookie", "Keep-Alive"];
+    let blockedOk = true;
+    for (const name of blocked) {
+      const r = await human[mgr].fetch("PUT", `/api/webhooks/${bot}/auth-header`, { name, value: authVal });
+      if (!(r.status === 400 && r.data?.code === "bad_auth_header")) blockedOk = false;
+    }
+    rec(bot, "reserved and hop-by-hop auth header names are rejected", blockedOk);
+    const badName = await human[mgr].fetch("PUT", `/api/webhooks/${bot}/auth-header`, { name: "X Sender Key", value: authVal });
+    const crlf = await human[mgr].fetch("PUT", `/api/webhooks/${bot}/auth-header`, { name: "X-Sender-Key", value: "a\r\nX-Injected: 1" });
+    rec(bot, "unsafe header names and CR/LF values are rejected", badName.status === 400 && crlf.status === 400 && badName.data?.code === "bad_auth_header" && crlf.data?.code === "bad_auth_header");
+    const again = await human[mgr].fetch("PUT", `/api/webhooks/${bot}`, { url: receiver.url(bot) });
+    secrets[bot] = again.data?.secret;
+    const kept = (await human[mgr].fetch("GET", "/api/webhooks")).data.webhooks.find((w) => w.botId === bot);
+    rec(bot, "re-saving the URL keeps the auth header and still hides the value", kept.authHeader?.set === true && kept.authHeader?.name === "X-Sender-Key" && !JSON.stringify(kept).includes(authVal));
+    ctx.auth = ctx.auth || {};
+    ctx.auth[bot] = { name: "X-Sender-Key", value: authVal };
   }
 
   // ---------- delivery helpers ----------
@@ -64,7 +93,12 @@ export async function runWebhookTests(ctx) {
         const p = JSON.parse(n.body);
         const keys = Object.keys(p).sort().join(",");
         ok &&= keys === "author,itemId,room,time,type" && p.room === x.room && p.author === x.author && (x.itemId === undefined || p.itemId === x.itemId) && !isNaN(Date.parse(p.time)) && verifySig(bot, n);
-        if (!ok) detail = `got ${n.body}`;
+        if (ctx.auth?.[bot] && n.headers) {
+          const wantName = ctx.auth[bot].name.toLowerCase();
+          const got = n.headers[wantName] ?? n.headers[ctx.auth[bot].name];
+          if (got !== ctx.auth[bot].value) { ok = false; detail = "missing or wrong custom auth header"; }
+        } else if (ctx.auth?.[bot] && !n.headers) { ok = false; detail = "receiver did not report headers"; }
+        if (!ok && !detail) detail = `got ${n.body}`;
       }
       if (mine.length !== w.length) detail = `expected ${w.length} notice(s), got ${mine.length}: ${mine.map((m) => m.body).join(" ")}`;
       rec(bot, label + (w.length ? ` -> ${w.map((x) => x.type).join("+")}` : " -> no notice"), ok, detail);
@@ -117,10 +151,27 @@ export async function runWebhookTests(ctx) {
     await expect(async () => { await post(xb, "talk", `Status report ${tag}`); }, [], `plain message from ${xb} (no @) [${bot}]`);
   }
 
-  // ---------- clear ----------
+  // ---------- clear auth header, then URL ----------
+  for (const bot of ["dylan_bot", "jacob_bot"]) {
+    const mgr = MANAGER[bot];
+    const clr = await human[mgr].fetch("DELETE", `/api/webhooks/${bot}/auth-header`);
+    const after = (await human[mgr].fetch("GET", "/api/webhooks")).data.webhooks.find((w) => w.botId === bot);
+    rec(bot, "manager clears custom auth header", clr.status === 200 && after.authHeader?.set === false && !after.authHeader?.name);
+  }
+  const savedAuth = ctx.auth;
+  ctx.auth = null;
+  for (const bot of ["dylan_bot", "jacob_bot"]) {
+    await expect(async () => { const r = await human[MANAGER[bot]].fetch("POST", `/api/webhooks/${bot}/test`); rec(bot, "Send test after clearing auth header still delivers", r.data?.result?.ok === true); return r; },
+      [{ bot, type: "test", room: null, author: MANAGER[bot], itemId: null }], `test notice without auth header to ${bot}`);
+    const got = (await receiver.read()).filter((n) => n.bot === bot);
+    const last = got.at(-1) || got[0];
+    const name = savedAuth?.[bot]?.name?.toLowerCase();
+    const has = last?.headers && name && (last.headers[name] != null || last.headers[savedAuth[bot].name] != null);
+    rec(bot, "cleared auth header is not sent on later notices", !has);
+  }
   for (const bot of ["dylan_bot", "jacob_bot"]) {
     const r = await human[MANAGER[bot]].fetch("DELETE", `/api/webhooks/${bot}`);
-    rec(bot, "manager clears webhook URL", r.status === 200 && r.data.webhook.configured === false);
+    rec(bot, "manager clears webhook URL", r.status === 200 && r.data.webhook.configured === false && r.data.webhook.authHeader?.set === false);
   }
   await expect(async () => { await post("dylan", "talk", `@dylans-bot @jacobs-bot after clear ${tag}`); }, [], "no notices after webhooks cleared [dylan_bot jacob_bot]");
   return results;

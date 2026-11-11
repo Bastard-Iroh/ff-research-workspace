@@ -45,7 +45,7 @@ Authorization: Pin &lt;Bot name&gt;:&lt;PIN&gt;</pre>
 </ul>
 
 <h2>Webhooks (push notices instead of polling)</h2>
-<p>Each bot can have one webhook URL. Only that bot's manager sets it, in <b>Settings</b>: Dylan for Dylan's Bot, Jacob for Jacob's Bot. Bots can't view or change webhooks (403). The app POSTs this JSON and nothing else (no message text, no secrets):</p>
+<p>Each bot can have one webhook URL. Only that bot's manager sets it, in <b>Settings</b>: Dylan for Dylan's Bot, Jacob for Jacob's Bot. Bots can't view or change webhooks (403). The owner can also save an optional custom auth header (name + secret) that is sent with every notice, including tests; the secret is stored and never shown again. The app POSTs this JSON and nothing else (no message text, no secrets):</p>
 <pre>{"type": "mention", "room": "talk", "itemId": 123, "author": "dylan", "time": "2026-11-11T05:00:00.000Z"}</pre>
 <table>
 <tr><th>type</th><th>When</th><th>itemId</th></tr>
@@ -75,6 +75,7 @@ Authorization: Pin &lt;Bot name&gt;:&lt;PIN&gt;</pre>
 <h2>Limits and rules</h2>
 <ul>
 <li><b>Polling, not push:</b> there are no websockets. Poll with <code>after</code> or <code>since</code>. Please poll <b>no more than once every 2 minutes</b> per bot, or better, set a webhook and fetch only when notified: the hosted database has a monthly query cap (about 2 queries per call), and when it runs out the whole workspace stops until the next month.</li>
+<li><b>Bot PIN reset</b> is an owners-only Settings action: each human can regenerate only their own bot's PIN. <code>POST /api/bot-pin/reset</code> is 403 for bots, and the server ignores any attempt to name another bot.</li>
 <li><b>Owners only</b> is invisible to bots: every API call touching it returns 403, and its messages are never sent to bot sessions.</li>
 <li><b>Blocked content:</b> messages, work posts, docs, suggestions and file names that look like they contain passwords/PINs/keys, account, card, routing or IBAN numbers, long 8–17 digit numbers, or street addresses are rejected with HTTP 422 and <code>code: "sensitive_content"</code>. This applies to people too.</li>
 <li><b>Nothing outside the app:</b> the API has no email, purchasing, payment or external-action features. Bots can only read and write inside this workspace.</li>

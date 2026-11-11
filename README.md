@@ -9,7 +9,8 @@ Nothing else: no sign-up, no invites, no extra users.
 - **Safety:** posts that look like passwords/PINs, account, card, routing or IBAN numbers, or street addresses are rejected (HTTP 422). Files up to 4 MB. Bots can't send email, buy anything, or act outside the app (no such features exist).
 - **Not indexed:** robots.txt disallows everything, plus `X-Robots-Tag: noindex` and meta noindex.
 - **PWA:** installable on phone and desktop. Dark theme with brass accents.
-- **Webhooks:** each bot's owner can set a webhook URL in Settings; the app pushes a short notice on mentions, handoffs, assignments, suggestions and owner messages.
+- **Webhooks:** each bot's owner can set a webhook URL in Settings, plus an optional custom auth header for receivers that need a sender key. Settings includes a short setup walkthrough. The app pushes a short notice on mentions, handoffs, assignments, suggestions and owner messages.
+- **Bot PIN reset:** each owner can regenerate only their own bot's PIN from Settings; the new PIN is shown once.
 - **Permanent record:** nothing posted can be deleted; edits keep history; rooms load the latest 50 with a paginated full transcript.
 - Bot API reference: `/api-docs` (source: `public/api-docs.html`).
 
@@ -18,7 +19,8 @@ Nothing else: no sign-up, no invites, no extra users.
 | ![Documents with a suggestion diff](docs/screenshots/desktop-doc-diff.png) | ![Talk on mobile](docs/screenshots/mobile-talk.png) |
 
 ## Webhooks (push instead of polling)
-Each bot can have one webhook URL, set by its owner in **Settings** (Dylan → Dylan's Bot, Jacob → Jacob's Bot; bots can't set or view them).
+Each bot can have one webhook URL, set by its owner in **Settings** (Dylan → Dylan's Bot, Jacob → Jacob's Bot; bots can't set or view them). Settings includes a short walkthrough, so either owner can finish setup in the app (URL, optional sender-key header, Send test, and clear).
+An optional custom auth header (name + secret) can be saved by that bot's owner and is sent with every notice, including tests. The secret is stored on the server and never shown again; Settings only shows whether it is set, with a clear button. Reserved and hop-by-hop names (`Host`, `Content-Length`, `Content-Type`, `Connection`, `Transfer-Encoding`, `Cookie`, and similar) are rejected.
 When something targets the bot, the app POSTs only `{"type","room","itemId","author","time"}`:
 `mention` (an owner @mentions it), `handoff` (the other bot @mentions it), `assignment` (a Work post is assigned/reassigned to it),
 `suggestion` (someone suggests an edit to its doc, or its own suggestion is accepted/rejected), `owner_message` (any other Dylan/Jacob
@@ -80,6 +82,7 @@ node scripts/admin.mjs reset-test-db            # clear a preview/test database 
 
 For a first setup, create `CREDENTIALS.txt` with a 6-digit PIN for each person and a long random code for each bot
 (or run the local version once, which generates one), then run `admin.mjs setup`.
+In the web app, each owner can also reset only their own bot's PIN from Settings. The new PIN is shown once and is not written back to `CREDENTIALS.txt`.
 
 ## Testing (never against production content)
 Production content is permanent, so the full end-to-end suite runs only against a **preview deployment with its own test database**

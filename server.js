@@ -6,11 +6,11 @@ import { Readable } from "node:stream";
 import { readFileSync } from "node:fs";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { put, get as blobGet, del as blobDel } from "@vercel/blob";
-import { q, one, nums, attemptLogin, memberRow, SCHEMA } from "./lib/db.js";
-import { member, listMembers, resolveMember, isBot, isHuman, refreshNames, validateBotName, MEMBER_IDS } from "./lib/members.js";
+import { q, one, nums, attemptLogin, memberRow, SCHEMA, resetOwnedBotPin, lastBotPinReset, ensureHookCols } from "./lib/db.js";
+import { member, listMembers, resolveMember, isBot, isHuman, botOf, refreshNames, validateBotName, MEMBER_IDS } from "./lib/members.js";
 import { checkSensitive } from "./lib/filter.js";
 import { waitUntil } from "@vercel/functions";
-import { BOTS, deliver, newSecret, validateWebhookUrl, noticesForMessage, noticesForReassign, noticesForSuggestion, noticesForDecision } from "./lib/webhooks.js";
+import { BOTS, deliver, newSecret, validateWebhookUrl, validateAuthHeader, noticesForMessage, noticesForReassign, noticesForSuggestion, noticesForDecision } from "./lib/webhooks.js";
 
 const MAX_FILE = 4 * 1024 * 1024;
 const MAX_BODY = 8000;
@@ -205,7 +205,13 @@ api.post("/webhook-test-sink/:token", express.text({ type: () => true, limit: "8
   const want = process.env.WEBHOOK_TEST_SINK_TOKEN || "";
   const a = createHash("sha256").update(want).digest(), b = createHash("sha256").update(req.params.token || "").digest();
   if (want.length < 24 || !timingSafeEqual(a, b)) return res.status(404).json({ error: "Not found." });
-  await q("INSERT INTO webhook_test_inbox (received_at, signature, event, tag, body) VALUES ($1,$2,$3,$4,$5)", [Date.now(), req.get("X-FFW-Signature") || null, req.get("X-FFW-Event") || null, String(req.query.bot || "").slice(0, 40), String(req.body || "")]);
+  await ensureHookCols();
+  const hdrs = {};
+  for (const [k, v] of Object.entries(req.headers || {})) {
+    if (["host", "content-length", "connection", "transfer-encoding"].includes(k)) continue;
+    hdrs[k] = v;
+  }
+  await q("INSERT INTO webhook_test_inbox (received_at, signature, event, tag, body, headers) VALUES ($1,$2,$3,$4,$5,$6)", [Date.now(), req.get("X-FFW-Signature") || null, req.get("X-FFW-Event") || null, String(req.query.bot || "").slice(0, 40), String(req.body || ""), JSON.stringify(hdrs)]);
   res.status(204).end();
 }));
 
@@ -307,8 +313,11 @@ function notify(notices) {
 async function hookOut(bot, viewer, h) {
   h ??= (await hookRow(bot)) || {};
   const canEdit = BOTS[bot] === viewer.id;
+  const authSet = !!(h.auth_header_name && h.auth_header_value);
   return { botId: bot, botName: member(bot).name, managedBy: BOTS[bot], managedByName: member(BOTS[bot]).name, canEdit, configured: !!h.url,
-    url: canEdit ? h.url || null : null, lastDelivery: h.last_at ? { status: h.last_status, error: h.last_error, type: h.last_type, at: h.last_at } : null };
+    url: canEdit ? h.url || null : null,
+    authHeader: { set: authSet, name: canEdit && authSet ? h.auth_header_name : null },
+    lastDelivery: h.last_at ? { status: h.last_status, error: h.last_error, type: h.last_type, at: h.last_at } : null };
 }
 function hookGuard(req, res, write) {
   if (!isHuman(req.user.id)) { res.status(403).json({ error: "Bots can't view or change webhooks." }); return null; }
@@ -320,8 +329,15 @@ function hookGuard(req, res, write) {
 }
 api.get("/webhooks", wrap(async (req, res) => {
   if (!hookGuard(req, res, false)) return;
+  await ensureHookCols();
   const rows = (await q("SELECT * FROM webhooks")).map(nums);
-  res.json({ webhooks: await Promise.all(Object.keys(BOTS).map((b) => hookOut(b, req.user, rows.find((r) => r.bot_id === b) || {}))) });
+  const bot = botOf(req.user.id);
+  const last = bot && await lastBotPinReset(bot);
+  res.json({
+    webhooks: await Promise.all(Object.keys(BOTS).map((b) => hookOut(b, req.user, rows.find((r) => r.bot_id === b) || {}))),
+    myBot: bot ? { id: bot, name: member(bot).name } : null,
+    pinReset: last ? { at: last.at, actor: last.actor, actorName: member(last.actor)?.name, bot: last.subject } : null,
+  });
 }));
 api.put("/webhooks/:bot", wrap(async (req, res) => {
   const bot = hookGuard(req, res, true); if (!bot) return;
@@ -338,6 +354,23 @@ api.delete("/webhooks/:bot", wrap(async (req, res) => {
   await q("DELETE FROM webhooks WHERE bot_id = $1", [bot]);
   res.json({ webhook: await hookOut(bot, req.user, {}) });
 }));
+
+api.put("/webhooks/:bot/auth-header", wrap(async (req, res) => {
+  const bot = hookGuard(req, res, true); if (!bot) return;
+  await ensureHookCols();
+  const row = await hookRow(bot);
+  if (!row?.url) return res.status(400).json({ error: "Set a webhook URL first." });
+  let auth;
+  try { auth = validateAuthHeader(req.body?.name, req.body?.value); } catch (e) { return res.status(400).json({ error: e.message, code: e.code || "bad_auth_header" }); }
+  await q("UPDATE webhooks SET auth_header_name = $1, auth_header_value = $2, updated_by = $3, updated_at = $4 WHERE bot_id = $5", [auth.name, auth.value, req.user.id, Date.now(), bot]);
+  res.json({ webhook: await hookOut(bot, req.user) });
+}));
+api.delete("/webhooks/:bot/auth-header", wrap(async (req, res) => {
+  const bot = hookGuard(req, res, true); if (!bot) return;
+  await ensureHookCols();
+  await q("UPDATE webhooks SET auth_header_name = NULL, auth_header_value = NULL, updated_by = $1, updated_at = $2 WHERE bot_id = $3", [req.user.id, Date.now(), bot]);
+  res.json({ webhook: await hookOut(bot, req.user) });
+}));
 api.post("/webhooks/:bot/test", wrap(async (req, res) => {
   const bot = hookGuard(req, res, true); if (!bot) return;
   const h = await hookRow(bot);
@@ -345,6 +378,33 @@ api.post("/webhooks/:bot/test", wrap(async (req, res) => {
   const r = await deliver(h, { type: "test", room: null, itemId: null, author: req.user.id, time: Date.now() }, HOOK_OPTS);
   await saveHookStatus(bot, r);
   res.json({ result: { ok: r.ok, status: r.status, error: r.error, attempts: r.attempts }, webhook: await hookOut(bot, req.user) });
+}));
+
+
+// ---------- owner resets their own bot PIN (no client-chosen target) ----------
+function foreignBotTarget(req, myBot) {
+  const raw = req.body?.bot ?? req.body?.botId ?? req.body?.id ?? req.body?.member ?? req.body?.target
+    ?? req.query?.bot ?? req.query?.botId ?? req.query?.id ?? req.query?.member ?? req.query?.target
+    ?? req.params?.bot;
+  if (raw == null || raw === "") return false;
+  const id = resolveMember(raw);
+  return !id || id !== myBot;
+}
+api.post("/bot-pin/reset", wrap(async (req, res) => {
+  if (!isHuman(req.user.id)) return res.status(403).json({ error: "Bots can't reset PINs." });
+  const bot = botOf(req.user.id);
+  if (!bot) return res.status(403).json({ error: "Only an owner can reset their own bot's PIN." });
+  if (foreignBotTarget(req, bot)) return res.status(403).json({ error: "You can only reset your own bot's PIN." });
+  const r = await resetOwnedBotPin(req.user.id);
+  if (!r.ok) return res.status(r.status).json({ error: r.error });
+  for (const [k, v] of headerCache) if (v.id === r.bot) headerCache.delete(k);
+  const pin = r.pin;
+  res.json({
+    bot: { id: r.bot, name: member(r.bot).name },
+    pin,
+    pinNote: "Shown once. Copy it now. The old PIN stops working immediately.",
+    reset: { actor: req.user.id, actorName: req.user.name, bot: r.bot, botName: member(r.bot).name, at: r.at },
+  });
 }));
 
 api.get("/whoami", (req, res) => {

@@ -17,7 +17,7 @@ const robots = await get("/robots.txt");
 check("robots.txt disallows all", /Disallow: \//.test(robots.data));
 for (const p of ["/", "/transcript.html", "/api-docs"]) { const r = await get(p); check(`${p} 200 + X-Robots-Tag noindex`, r.status === 200 && /noindex/.test(r.headers.get("x-robots-tag") || "")); }
 const docs = await get("/api-docs");
-check("api-docs documents webhooks, permanent record and transcripts", /Webhooks/.test(docs.data) && /Permanent record/.test(docs.data) && /\/transcript/.test(docs.data));
+check("api-docs documents webhooks, permanent record, transcripts and bot PIN reset", /Webhooks/.test(docs.data) && /Permanent record/.test(docs.data) && /\/transcript/.test(docs.data) && /Bot PIN reset/.test(docs.data) && /custom auth header/.test(docs.data));
 check("manifest + service worker served", (await get("/manifest.webmanifest")).status === 200 && (await get("/sw.js")).status === 200);
 check("no sign-in → 401 (whoami, transcript)", (await get("/api/whoami")).status === 401 && (await get("/api/rooms/talk/transcript")).status === 401);
 check("webhook test sink disabled on production (404)", (await get("/api/webhook-test-sink/x".padEnd(60, "x"), null, "POST", {})).status === 404);
@@ -30,6 +30,8 @@ for (const bot of ["dylan_bot", "jacob_bot"]) {
   check(`${bot}: Talk transcript paginated`, t.status === 200 && t.data.pageSize === 20 && t.data.totalPages === Math.max(1, Math.ceil(t.data.total / 20)), `${t.data.total} total`);
   check(`${bot}: Owners only transcript → 403`, (await get("/api/rooms/owners/transcript", basic(bot))).status === 403);
   check(`${bot}: webhooks settings → 403`, (await get("/api/webhooks", basic(bot))).status === 403);
+  check(`${bot}: reset bot PIN → 403`, (await get("/api/bot-pin/reset", basic(bot), "POST", {})).status === 403);
+  check(`${bot}: auth-header set/clear → 403`, (await get(`/api/webhooks/${bot}/auth-header`, basic(bot), "PUT", { name: "X-Sender-Key", value: "x" })).status === 403 && (await get(`/api/webhooks/${bot}/auth-header`, basic(bot), "DELETE")).status === 403);
   const id = m.data.messages?.[0]?.id || 1;
   const del = await get(`/api/messages/${id}`, basic(bot), "DELETE"), put = await get(`/api/messages/${id}`, basic(bot), "PUT", { body: "x" });
   check(`${bot}: DELETE/PUT message → 405 permanent_record`, del.status === 405 && put.status === 405 && del.data.code === "permanent_record");
@@ -41,6 +43,8 @@ for (const human of ["dylan", "jacob"]) {
   check(`${human}: Owners only transcript visible`, o.status === 200 && o.data.room === "owners");
   const w = await get("/api/webhooks", ck);
   check(`${human}: Settings lists both bots' webhooks`, w.status === 200 && w.data.webhooks.length === 2);
+  check(`${human}: Settings names only their own bot for PIN reset`, w.status === 200 && w.data.myBot?.id === (human === "dylan" ? "dylan_bot" : "jacob_bot") && !("pin" in w.data) && !w.data.webhooks.some((x) => "pin" in x));
+  check(`${human}: webhook auth header is set/not set only, never a stored value`, w.data.webhooks.every((x) => x.authHeader && typeof x.authHeader.set === "boolean" && !("value" in x.authHeader)));
   const d = await get("/api/docs", ck);
   if (d.data.docs?.length) { const v = await get(`/api/docs/${d.data.docs[0].id}/versions`, ck); check(`${human}: doc version history readable`, v.status === 200 && v.data.versions.length >= 1); }
   const dl = await get("/api/docs/1", ck, "DELETE");

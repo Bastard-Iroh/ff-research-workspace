@@ -3,7 +3,7 @@ import { mkdirSync, existsSync, writeFileSync, readFileSync, chmodSync } from "n
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes, randomInt, scryptSync, timingSafeEqual } from "node:crypto";
-import { MEMBER_IDS, member, isBot } from "./members.js";
+import { MEMBER_IDS, member, isBot, isHuman, botOf } from "./members.js";
 
 export const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const DATA_DIR = process.env.FFW_DATA_DIR || join(ROOT, "data");
@@ -93,7 +93,9 @@ export function initDb() {
       last_status TEXT,
       last_error TEXT,
       last_type TEXT,
-      last_at INTEGER
+      last_at INTEGER,
+      auth_header_name TEXT,
+      auth_header_value TEXT
     );
     CREATE TABLE IF NOT EXISTS suggestions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,12 +111,23 @@ export function initDb() {
       decided_at INTEGER,
       decided_by TEXT
     );
+    CREATE TABLE IF NOT EXISTS audit_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_type_subject ON audit_events(type, subject, id);
   `);
   // Permanent record: make sure every existing doc has at least its current version saved.
   db.exec(`INSERT INTO doc_versions (doc_id, version, title, body, author, source, at)
     SELECT d.id, 1, d.title, d.body, d.updated_by, 'existing', d.updated_at FROM docs d
     WHERE NOT EXISTS (SELECT 1 FROM doc_versions v WHERE v.doc_id = d.id)`);
   ensurePins();
+  for (const col of ["auth_header_name", "auth_header_value"]) {
+    try { db.exec(`ALTER TABLE webhooks ADD COLUMN ${col} TEXT`); } catch {}
+  }
 }
 
 export function getSessionSecret() {
@@ -189,6 +202,21 @@ export function resetPin(id) {
   writeCreds(creds);
 }
 
+
+/** Rotate the signed-in owner's own bot PIN. Returns the new PIN to the caller only; never writes it to disk or logs. */
+export function resetOwnedBotPin(actorId) {
+  const bot = botOf(actorId);
+  if (!isHuman(actorId) || !bot) return { ok: false, status: 403, error: "Only an owner can reset their own bot's PIN." };
+  const pin = generatePin(bot);
+  const now = Date.now();
+  db.prepare("UPDATE members SET pin_hash = ?, pin_version = pin_version + 1, failed = 0, locked_until = 0 WHERE id = ?").run(hashPin(pin), bot);
+  db.prepare("INSERT INTO audit_events (type, actor, subject, at) VALUES ('bot_pin_reset', ?, ?, ?)").run(actorId, bot, now);
+  return { ok: true, pin, bot, at: now };
+}
+
+export function lastBotPinReset(botId) {
+  return db.prepare("SELECT actor, subject, at FROM audit_events WHERE type = 'bot_pin_reset' AND subject = ? ORDER BY id DESC LIMIT 1").get(botId) || null;
+}
 export function unlock(id) {
   db.prepare("UPDATE members SET failed = 0, locked_until = 0 WHERE id = ?").run(id);
 }

@@ -175,7 +175,7 @@
   // ---------- settings: bot webhooks (humans only) ----------
   async function openSettings() {
     state.room = "settings"; state.editing = false; renderNav(); $("#transcript-link").classList.add("hidden"); $("#toast").classList.add("hidden");
-    $("#room-title").textContent = "Settings"; $("#room-desc").textContent = "Bot webhooks: get a short notice when something targets a bot.";
+    $("#room-title").textContent = "Settings"; $("#room-desc").textContent = "Bot webhooks and your bot's PIN.";
     let data;
     try { data = await api("/api/webhooks"); } catch (err) { $("#view").innerHTML = `<p class="empty">${esc(err.message)}</p>`; return; }
     const card = (w) => `<section class="sugg" data-bot="${w.botId}">
@@ -186,11 +186,38 @@
             <button class="brass small" data-act="save">Save</button>
             <button class="small" data-act="test" ${w.configured ? "" : "disabled"}>Send test</button>
             <button class="danger small" data-act="clear" ${w.configured ? "" : "disabled"}>Clear</button></div>
-          <p class="muted hook-secret"></p>` : `<p class="muted">Only ${esc(w.managedByName)} can change this.</p>`}
+          <p class="muted hook-secret"></p>
+          <p class="muted" style="margin-top:12px">Custom auth header: <b>${w.authHeader?.set ? "set" : "not set"}</b>${w.authHeader?.name ? " (" + esc(w.authHeader.name) + ")" : ""}. Sent with every notice, including tests. The secret is stored and never shown again.</p>
+          <div class="row" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+            <input class="hook-auth-name" style="flex:1;min-width:160px" placeholder="Header name (e.g. X-Sender-Key)" value="${esc(w.authHeader?.name || "")}" ${w.configured ? "" : "disabled"}>
+            <input class="hook-auth-value" style="flex:1;min-width:160px" type="password" autocomplete="off" placeholder="${w.authHeader?.set ? "Enter a new value to replace it" : "Secret value"}" ${w.configured ? "" : "disabled"}>
+            <button class="brass small" data-act="save-auth" ${w.configured ? "" : "disabled"}>Save header</button>
+            <button class="danger small" data-act="clear-auth" ${w.authHeader?.set ? "" : "disabled"}>Clear header</button>
+          </div>` : `<p class="muted">Only ${esc(w.managedByName)} can change this.${w.authHeader?.set ? " Custom auth header: set." : " Custom auth header: not set."}</p>`}
       </section>`;
+    const pinCard = data.myBot ? `<section class="sugg" id="bot-pin">
+        <h3>Reset my bot's PIN</h3>
+        <p class="muted">This makes a new PIN for <b>${esc(data.myBot.name)}</b> only. The current PIN stops working immediately. You'll see the new one once — copy it now.</p>
+        ${data.pinReset ? `<p class="muted">Last reset ${fmtTime(data.pinReset.at)} by ${esc(data.pinReset.actorName)}.</p>` : ""}
+        <div class="toolbar" style="margin-top:8px">
+          <button class="danger small" id="reset-bot-pin">Reset my bot's PIN</button>
+          <button class="ghost small hidden" id="cancel-bot-pin">Cancel</button>
+        </div>
+        <p class="muted" id="new-bot-pin"></p>
+      </section>` : "";
     $("#view").innerHTML = `<div class="docpane" id="settings">
+      <div class="sugg" id="hook-help">
+        <h3>Set up your bot's webhook</h3>
+        <ol class="muted" style="padding-left:1.2em;margin:8px 0">
+          <li>Paste your bot's HTTPS webhook URL under your bot's name and click Save. Copy the signing secret when it appears — it is shown only once.</li>
+          <li>If the receiver needs a sender key, enter the header name and secret, then click Save header. The secret is stored on the server and never shown again.</li>
+          <li>Click Send test. A successful delivery means your bot will get a short notice when something targets it.</li>
+          <li>Clear the header or the URL at any time. You can only change your own bot (Dylan → Dylan's Bot, Jacob → Jacob's Bot).</li>
+        </ol>
+      </div>
       <p class="muted">Notices are sent for: @mentions and bot handoffs, Work posts assigned to the bot, suggestions on the bot's docs (and decisions on its suggestions), and any message from Dylan or Jacob. Never for Owners only, never for the bot's own actions. Payload: <code>{type, room, itemId, author, time}</code>, no message text.</p>
-      ${data.webhooks.map(card).join("")}</div>`;
+      ${data.webhooks.map(card).join("")}
+      ${pinCard}</div>`;
     document.querySelectorAll("#settings [data-act]").forEach((b) => b.onclick = async () => {
       const sec = b.closest("[data-bot]"), bot = sec.dataset.bot;
       try {
@@ -202,6 +229,12 @@
           toast("Webhook saved.");
         } else if (b.dataset.act === "clear") {
           await api(`/api/webhooks/${bot}`, { method: "DELETE" }); toast("Webhook cleared."); openSettings();
+        } else if (b.dataset.act === "save-auth") {
+          await api(`/api/webhooks/${bot}/auth-header`, { method: "PUT", body: JSON.stringify({ name: sec.querySelector(".hook-auth-name").value, value: sec.querySelector(".hook-auth-value").value }) });
+          toast("Auth header saved. The secret will not be shown again.");
+          openSettings();
+        } else if (b.dataset.act === "clear-auth") {
+          await api(`/api/webhooks/${bot}/auth-header`, { method: "DELETE" }); toast("Auth header cleared."); openSettings();
         } else {
           const r = await api(`/api/webhooks/${bot}/test`, { method: "POST" });
           toast(r.result.ok ? `Test delivered (${r.result.status}).` : `Test failed: ${r.result.status}${r.result.error ? " - " + r.result.error : ""}`, !r.result.ok);
@@ -209,6 +242,35 @@
         }
       } catch (err) { toast(err.message, true); }
     });
+    const resetBtn = $("#reset-bot-pin"), cancelBtn = $("#cancel-bot-pin"), pinOut = $("#new-bot-pin");
+    if (resetBtn) {
+      let pending = false;
+      cancelBtn.onclick = () => { pending = false; resetBtn.disabled = false; resetBtn.textContent = "Reset my bot's PIN"; cancelBtn.classList.add("hidden"); };
+      resetBtn.onclick = async () => {
+        if (!pending) {
+          pending = true;
+          resetBtn.textContent = "Confirm reset — the old PIN will stop working";
+          cancelBtn.classList.remove("hidden");
+          return;
+        }
+        resetBtn.disabled = true;
+        cancelBtn.classList.add("hidden");
+        try {
+          const r = await api("/api/bot-pin/reset", { method: "POST", body: "{}" });
+          pinOut.innerHTML = `New PIN for ${esc(r.bot.name)} (shown once, copy it now): <code class="secret-once" id="bot-pin-value">${esc(r.pin)}</code> <button class="brass small" id="copy-bot-pin">Copy</button><br>${esc(r.pinNote || "")}`;
+          $("#copy-bot-pin").onclick = async () => {
+            try { await navigator.clipboard.writeText(r.pin); toast("PIN copied."); }
+            catch { toast("Copy failed — select and copy it yourself.", true); }
+          };
+          toast("New bot PIN created. The old one no longer works.");
+        } catch (err) {
+          toast(err.message, true);
+          pending = false;
+          resetBtn.disabled = false;
+          resetBtn.textContent = "Reset my bot's PIN";
+        }
+      };
+    }
   }
 
   // ---------- documents ----------
