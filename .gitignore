@@ -1,6 +1,5 @@
 # secrets and local state - never commit
 CREDENTIALS.txt
-.admin-secret
 .env
 .env.*
 !.env.example
@@ -12,3 +11,6 @@ node_modules/
 *.log
 *.db
 *.db-*
+.admin-secret*
+.sink-token*
+.bypass-secret*

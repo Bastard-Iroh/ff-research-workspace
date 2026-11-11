@@ -8,6 +8,7 @@ import { writeFileSync, createReadStream, existsSync } from "node:fs";
 import { initDb, getDb, getSessionSecret, attemptLogin, memberRow, ROOT, FILES_DIR } from "./lib/db.js";
 import { member, listMembers, resolveMember, isBot, isHuman } from "./lib/members.js";
 import { checkSensitive } from "./lib/filter.js";
+import { BOTS, deliver, newSecret, validateWebhookUrl, noticesForMessage, noticesForReassign, noticesForSuggestion, noticesForDecision } from "./lib/webhooks.js";
 
 const PORT = Number(process.env.PORT) || 3480;
 const HOST = process.env.HOST || "0.0.0.0";
@@ -207,6 +208,63 @@ api.post("/logout", (req, res) => { req.session = null; res.json({ ok: true }); 
 
 api.use(requireAuth);
 
+// ---------- bot webhooks ----------
+// The box version also allows http://localhost URLs (for local receivers). Everything else must be https.
+const HOOK_OPTS = { allowLocalHttp: true };
+const hookRow = (bot) => db.prepare("SELECT * FROM webhooks WHERE bot_id = ?").get(bot);
+function saveHookStatus(bot, r) {
+  db.prepare("UPDATE webhooks SET last_status = ?, last_error = ?, last_type = ?, last_at = ? WHERE bot_id = ?").run(r.status, r.error, r.type, r.at, bot);
+}
+/** Fire-and-forget delivery; never blocks the request. */
+function notify(notices) {
+  for (const n of notices) {
+    const h = hookRow(n.bot);
+    if (!h?.url) continue;
+    deliver(h, { ...n, time: Date.now() }, HOOK_OPTS).then((r) => saveHookStatus(n.bot, r)).catch(() => {});
+  }
+}
+function hookOut(bot, viewer) {
+  const h = hookRow(bot) || {};
+  const canEdit = BOTS[bot] === viewer.id;
+  return { botId: bot, botName: member(bot).name, managedBy: BOTS[bot], managedByName: member(BOTS[bot]).name, canEdit, configured: !!h.url,
+    url: canEdit ? h.url || null : null, lastDelivery: h.last_at ? { status: h.last_status, error: h.last_error, type: h.last_type, at: h.last_at } : null };
+}
+function hookGuard(req, res, write) {
+  if (!isHuman(req.user.id)) { res.status(403).json({ error: "Bots can't view or change webhooks." }); return null; }
+  if (!write) return true;
+  const bot = resolveMember(req.params.bot);
+  if (!BOTS[bot]) { res.status(404).json({ error: "No such bot." }); return null; }
+  if (BOTS[bot] !== req.user.id) { res.status(403).json({ error: `Only ${member(BOTS[bot]).name} can change ${member(bot).name}'s webhook.` }); return null; }
+  return bot;
+}
+api.get("/webhooks", (req, res) => {
+  if (!hookGuard(req, res, false)) return;
+  res.json({ webhooks: Object.keys(BOTS).map((b) => hookOut(b, req.user)) });
+});
+api.put("/webhooks/:bot", async (req, res) => {
+  const bot = hookGuard(req, res, true); if (!bot) return;
+  let url;
+  try { url = await validateWebhookUrl(req.body?.url, HOOK_OPTS); } catch (e) { return res.status(400).json({ error: e.message, code: "bad_webhook_url" }); }
+  const secret = newSecret();
+  db.prepare(`INSERT INTO webhooks (bot_id, url, secret, updated_by, updated_at) VALUES (?,?,?,?,?)
+    ON CONFLICT(bot_id) DO UPDATE SET url = excluded.url, secret = excluded.secret, updated_by = excluded.updated_by, updated_at = excluded.updated_at,
+    last_status = NULL, last_error = NULL, last_type = NULL, last_at = NULL`).run(bot, url, secret, req.user.id, Date.now());
+  res.json({ webhook: hookOut(bot, req.user), secret, secretNote: "Shown once. Use it to check the X-FFW-Signature header (HMAC-SHA256 of the raw body)." });
+});
+api.delete("/webhooks/:bot", (req, res) => {
+  const bot = hookGuard(req, res, true); if (!bot) return;
+  db.prepare("DELETE FROM webhooks WHERE bot_id = ?").run(bot);
+  res.json({ webhook: hookOut(bot, req.user) });
+});
+api.post("/webhooks/:bot/test", async (req, res) => {
+  const bot = hookGuard(req, res, true); if (!bot) return;
+  const h = hookRow(bot);
+  if (!h?.url) return res.status(400).json({ error: "Set a webhook URL first." });
+  const r = await deliver(h, { type: "test", room: null, itemId: null, author: req.user.id, time: Date.now() }, HOOK_OPTS);
+  saveHookStatus(bot, r);
+  res.json({ result: { ok: r.ok, status: r.status, error: r.error, attempts: r.attempts }, webhook: hookOut(bot, req.user) });
+});
+
 api.get("/whoami", (req, res) => {
   const u = req.user;
   res.json({ ...u, ownerName: u.owner ? member(u.owner).name : null,
@@ -221,16 +279,40 @@ api.get("/rooms", (req, res) => {
 api.get("/rooms/:room/messages", (req, res) => {
   const room = roomAccess(req, res, req.params.room); if (!room) return;
   if (!MESSAGE_ROOMS.includes(room.id)) return res.status(400).json({ error: "Documents has no messages; use /api/docs." });
-  const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
+  const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 500);
   const where = ["room = ?"]; const args = [room.id];
   if (req.query.after) { where.push("id > ?"); args.push(Number(req.query.after)); }
   if (req.query.before) { where.push("id < ?"); args.push(Number(req.query.before)); }
   if (req.query.author) { const a = resolveMember(req.query.author); if (!a) return res.status(400).json({ error: "Unknown author." }); where.push("author = ?"); args.push(a); }
   if (req.query.status && room.id === "work") { where.push("status = ?"); args.push(String(req.query.status)); }
   const order = req.query.after ? "ASC" : "DESC";
-  let rows = db.prepare(`SELECT * FROM messages WHERE ${where.join(" AND ")} ORDER BY id ${order} LIMIT ?`).all(...args, limit);
+  let rows = db.prepare(`SELECT * FROM messages WHERE ${where.join(" AND ")} ORDER BY id ${order} LIMIT ?`).all(...args, limit + 1);
+  const hasMore = rows.length > limit;
+  rows = rows.slice(0, limit);
   if (order === "DESC") rows = rows.reverse();
-  res.json({ room: room.id, messages: rows.map((r) => messageOut(r, req.user)) });
+  res.json({ room: room.id, messages: rows.map((r) => messageOut(r, req.user)), hasMore, serverTime: Date.now() });
+});
+
+// Full transcript: every message in a room, oldest first, paginated. Owners only stays 403 for bots.
+api.get("/rooms/:room/transcript", (req, res) => {
+  const room = roomAccess(req, res, req.params.room); if (!room) return;
+  if (!MESSAGE_ROOMS.includes(room.id)) return res.status(400).json({ error: "Documents has no transcript; see /api/docs/:id/versions." });
+  const pageSize = Math.min(Math.max(Number(req.query.pageSize) || 100, 1), 200);
+  const total = db.prepare("SELECT COUNT(*) c FROM messages WHERE room = ?").get(room.id).c;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const page = Math.min(Math.max(Number(req.query.page) || 1, 1), totalPages);
+  const rows = db.prepare("SELECT * FROM messages WHERE room = ? ORDER BY id ASC LIMIT ? OFFSET ?").all(room.id, pageSize, (page - 1) * pageSize);
+  const ids = rows.filter((r) => r.room === "work").map((r) => r.id);
+  const revs = ids.length ? db.prepare(`SELECT * FROM revisions WHERE message_id IN (${ids.map(() => "?").join(",")}) ORDER BY id`).all(...ids) : [];
+  res.json({ room: room.id, roomName: room.name, page, pageSize, total, totalPages,
+    messages: rows.map((r) => ({ ...messageOut(r, req.user), history: revs.filter((v) => v.message_id === r.id).map(revisionOut) })) });
+});
+const revisionOut = (v) => ({ id: v.id, actor: v.actor, actorName: member(v.actor)?.name, changes: JSON.parse(v.changes), at: v.at });
+api.get("/messages/:id/history", (req, res) => {
+  const row = db.prepare("SELECT * FROM messages WHERE id = ?").get(Number(req.params.id));
+  if (!row) return res.status(404).json({ error: "No such message." });
+  if (!roomAccess(req, res, row.room)) return;
+  res.json({ message: messageOut(row, req.user), history: db.prepare("SELECT * FROM revisions WHERE message_id = ? ORDER BY id").all(row.id).map(revisionOut) });
 });
 
 function createMessage(req, res, roomId, body, extra = {}) {
@@ -248,6 +330,7 @@ function createMessage(req, res, roomId, body, extra = {}) {
     .run(roomId, req.user.id, body, JSON.stringify(mentions), JSON.stringify(rules.commands), status, assignee, extra.fileId ?? null, now, now);
   const row = db.prepare("SELECT * FROM messages WHERE id = ?").get(r.lastInsertRowid);
   broadcastMessage("message:new", row);
+  notify(noticesForMessage(row));
   return row;
 }
 
@@ -283,8 +366,13 @@ api.patch("/messages/:id", (req, res) => {
     else { assignee = resolveMember(req.body.assignee); if (!assignee) return res.status(400).json({ error: "Unknown assignee." }); }
   }
   db.prepare("UPDATE messages SET status = ?, assignee = ?, updated_at = ? WHERE id = ?").run(status, assignee, Date.now(), row.id);
+  const changes = {};
+  if (status !== row.status) changes.status = [row.status, status];
+  if (assignee !== row.assignee) changes.assignee = [row.assignee, assignee];
+  if (Object.keys(changes).length) db.prepare("INSERT INTO revisions (message_id, actor, changes, at) VALUES (?,?,?,?)").run(row.id, req.user.id, JSON.stringify(changes), Date.now());
   const updated = db.prepare("SELECT * FROM messages WHERE id = ?").get(row.id);
   broadcastMessage("message:update", updated);
+  notify(noticesForReassign(updated, row.assignee, req.user.id));
   res.json({ message: messageOut(updated, req.user) });
 });
 
@@ -323,6 +411,17 @@ api.get("/files/:id", (req, res) => {
 });
 
 // ---------- documents ----------
+// Permanent record: every saved state of a doc is kept as a numbered version.
+function saveVersion(docId, title, body, author, source, suggestionId, at) {
+  const v = db.prepare("SELECT COALESCE(MAX(version), 0) + 1 AS n FROM doc_versions WHERE doc_id = ?").get(docId).n;
+  db.prepare("INSERT INTO doc_versions (doc_id, version, title, body, author, source, suggestion_id, at) VALUES (?,?,?,?,?,?,?,?)").run(docId, v, title, body, author, source, suggestionId, at);
+}
+api.get("/docs/:id/versions", (req, res) => {
+  const d = db.prepare("SELECT id FROM docs WHERE id = ?").get(Number(req.params.id));
+  if (!d) return res.status(404).json({ error: "No such document." });
+  res.json({ versions: db.prepare("SELECT * FROM doc_versions WHERE doc_id = ? ORDER BY version DESC").all(d.id)
+    .map((v) => ({ version: v.version, title: v.title, body: v.body, author: v.author, authorName: member(v.author)?.name, source: v.source, suggestionId: v.suggestion_id, at: v.at })) });
+});
 api.get("/docs", (req, res) => {
   let rows = db.prepare("SELECT * FROM docs ORDER BY updated_at DESC").all();
   if (req.query.owner) { const o = resolveMember(req.query.owner); rows = rows.filter((d) => d.owner === o); }
@@ -336,6 +435,7 @@ api.post("/docs", (req, res) => {
   if (blocked(res, title, body)) return;
   const now = Date.now();
   const r = db.prepare("INSERT INTO docs (title, body, owner, created_at, updated_at, updated_by) VALUES (?,?,?,?,?,?)").run(title, body, req.user.id, now, now, req.user.id);
+  saveVersion(Number(r.lastInsertRowid), title, body, req.user.id, "create", null, now);
   const d = db.prepare("SELECT * FROM docs WHERE id = ?").get(r.lastInsertRowid);
   io.emit("doc:update", { id: d.id });
   res.status(201).json({ doc: { ...docSummary(d), body: d.body } });
@@ -360,6 +460,7 @@ function makeSuggestion(req, res, d) {
   const r = db.prepare("INSERT INTO suggestions (doc_id, author, base_title, base_body, title, body, note, created_at) VALUES (?,?,?,?,?,?,?,?)")
     .run(d.id, req.user.id, d.title, d.body, title, body, note, Date.now());
   const s = db.prepare("SELECT * FROM suggestions WHERE id = ?").get(r.lastInsertRowid);
+  notify(noticesForSuggestion(d, req.user.id));
   io.emit("doc:update", { id: d.id });
   res.status(202).json({ suggested: true, suggestion: suggestionOut(s), message: `You don't own this doc, so your edit was saved as a suggestion for ${member(d.owner).name} to accept or reject.` });
 }
@@ -370,7 +471,9 @@ api.put("/docs/:id", (req, res) => {
   const body = String(req.body?.body ?? d.body);
   if (body.length > MAX_DOC) return res.status(400).json({ error: "Document is too long." });
   if (blocked(res, title, body)) return;
-  db.prepare("UPDATE docs SET title = ?, body = ?, updated_at = ?, updated_by = ? WHERE id = ?").run(title, body, Date.now(), req.user.id, d.id);
+  const at = Date.now();
+  db.prepare("UPDATE docs SET title = ?, body = ?, updated_at = ?, updated_by = ? WHERE id = ?").run(title, body, at, req.user.id, d.id);
+  saveVersion(d.id, title, body, req.user.id, "edit", null, at);
   io.emit("doc:update", { id: d.id });
   const nd = db.prepare("SELECT * FROM docs WHERE id = ?").get(d.id);
   res.json({ suggested: false, doc: { ...docSummary(nd), body: nd.body } });
@@ -393,14 +496,22 @@ api.post("/suggestions/:id/:action", (req, res) => {
   if (d.owner !== req.user.id) return res.status(403).json({ error: `Only the doc owner (${member(d.owner).name}) can ${action} suggestions.` });
   if (s.status !== "pending") return res.status(409).json({ error: `Suggestion is already ${s.status}.` });
   const now = Date.now();
-  if (action === "accept") db.prepare("UPDATE docs SET title = ?, body = ?, updated_at = ?, updated_by = ? WHERE id = ?").run(s.title, s.body, now, s.author, d.id);
+  if (action === "accept") {
+    db.prepare("UPDATE docs SET title = ?, body = ?, updated_at = ?, updated_by = ? WHERE id = ?").run(s.title, s.body, now, s.author, d.id);
+    saveVersion(d.id, s.title, s.body, s.author, "suggestion", s.id, now);
+  }
   db.prepare("UPDATE suggestions SET status = ?, decided_at = ?, decided_by = ? WHERE id = ?").run(action === "accept" ? "accepted" : "rejected", now, req.user.id, s.id);
+  notify(noticesForDecision(d, s.author, req.user.id));
   io.emit("doc:update", { id: d.id });
   const nd = db.prepare("SELECT * FROM docs WHERE id = ?").get(d.id);
   res.json({ suggestion: suggestionOut(db.prepare("SELECT * FROM suggestions WHERE id = ?").get(s.id)), doc: { ...docSummary(nd), body: nd.body },
     staleBase: s.base_body !== d.body || s.base_title !== d.title });
 });
 
+// Permanent record: nothing posted can be deleted, and message text can't be edited.
+const PERMANENT = (_req, res) => res.status(405).set("Allow", "GET, POST, PATCH").json({ error: "Everything posted here is permanent. Messages, work posts, documents, suggestions and files can't be deleted.", code: "permanent_record" });
+api.delete(/^\/(rooms|messages|docs|suggestions|files)(\/.*)?$/, PERMANENT);
+api.put(/^\/messages(\/.*)?$/, PERMANENT);
 api.use((_req, res) => res.status(404).json({ error: "Not found." }));
 api.use((err, _req, res, _next) => {
   if (err.type === "entity.too.large") return res.status(413).json({ error: "Upload is over the 4 MB limit." });

@@ -4,7 +4,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-export const CONFIG_PATH = join(ROOT, "config", "members.json");
+export const CONFIG_PATH = process.env.FFW_CONFIG || join(ROOT, "config", "members.json");
 
 const FIXED = {
   dylan: { type: "human", owner: null, defaultName: "Dylan", defaultHandle: "dylan" },

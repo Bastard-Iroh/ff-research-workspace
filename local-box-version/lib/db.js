@@ -6,9 +6,9 @@ import { randomBytes, randomInt, scryptSync, timingSafeEqual } from "node:crypto
 import { MEMBER_IDS, member, isBot } from "./members.js";
 
 export const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-export const DATA_DIR = join(ROOT, "data");
+export const DATA_DIR = process.env.FFW_DATA_DIR || join(ROOT, "data");
 export const FILES_DIR = join(DATA_DIR, "files");
-export const CREDENTIALS_PATH = join(ROOT, "CREDENTIALS.txt");
+export const CREDENTIALS_PATH = process.env.FFW_CREDENTIALS || join(ROOT, "CREDENTIALS.txt");
 const DB_PATH = join(DATA_DIR, "ff-workspace.db");
 const SECRET_PATH = join(DATA_DIR, "session-secret.txt");
 
@@ -64,6 +64,37 @@ export function initDb() {
       updated_at INTEGER NOT NULL,
       updated_by TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS revisions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      message_id INTEGER NOT NULL REFERENCES messages(id),
+      actor TEXT NOT NULL,
+      changes TEXT NOT NULL,
+      at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_revisions_msg ON revisions(message_id);
+    CREATE TABLE IF NOT EXISTS doc_versions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      doc_id INTEGER NOT NULL REFERENCES docs(id),
+      version INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      author TEXT NOT NULL,
+      source TEXT NOT NULL,
+      suggestion_id INTEGER,
+      at INTEGER NOT NULL,
+      UNIQUE(doc_id, version)
+    );
+    CREATE TABLE IF NOT EXISTS webhooks (
+      bot_id TEXT PRIMARY KEY,
+      url TEXT NOT NULL,
+      secret TEXT NOT NULL,
+      updated_by TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      last_status TEXT,
+      last_error TEXT,
+      last_type TEXT,
+      last_at INTEGER
+    );
     CREATE TABLE IF NOT EXISTS suggestions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       doc_id INTEGER NOT NULL REFERENCES docs(id),
@@ -79,6 +110,10 @@ export function initDb() {
       decided_by TEXT
     );
   `);
+  // Permanent record: make sure every existing doc has at least its current version saved.
+  db.exec(`INSERT INTO doc_versions (doc_id, version, title, body, author, source, at)
+    SELECT d.id, 1, d.title, d.body, d.updated_by, 'existing', d.updated_at FROM docs d
+    WHERE NOT EXISTS (SELECT 1 FROM doc_versions v WHERE v.doc_id = d.id)`);
   ensurePins();
 }
 

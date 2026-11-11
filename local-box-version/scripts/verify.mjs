@@ -4,6 +4,8 @@ import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import puppeteer from "puppeteer-core";
+import { runWebhookTests } from "./verify-webhooks.mjs";
+import { runPermanentTests } from "./verify-permanent.mjs";
 import { io as ioClient } from "socket.io-client";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -14,7 +16,7 @@ const results = [];
 const check = (name, ok, detail = "") => { results.push({ name, ok: !!ok, detail }); console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? "  — " + detail : ""}`); };
 const clickJs = (page, sel) => page.$eval(sel, (e) => e.click());
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-function creds() { const o = {}; for (const l of readFileSync(join(ROOT, "CREDENTIALS.txt"), "utf8").split("\n")) { const m = l.match(/^([a-z_]+)\s*\|[^|]*\|\s*(\S+)\s*$/); if (m) o[m[1]] = m[2]; } return o; }
+function creds() { const o = {}; for (const l of readFileSync(process.env.FFW_CREDENTIALS || join(ROOT, "CREDENTIALS.txt"), "utf8").split("\n")) { const m = l.match(/^([a-z_]+)\s*\|[^|]*\|\s*(\S+)\s*$/); if (m) o[m[1]] = m[2]; } return o; }
 let C = creds();
 const admin = (...a) => execFileSync("node", [join(ROOT, "scripts/admin.mjs"), ...a], { encoding: "utf8" });
 const basic = (id, pin = C[id]) => "Basic " + Buffer.from(`${id}:${pin}`).toString("base64");
@@ -210,6 +212,23 @@ const jacobS = await sessionFor("jacob");
   check("reset-pin: old PIN fails, new PIN from CREDENTIALS.txt works, PIN not printed", oldR.status === 401 && newR.status === 200 && !rout.includes(C.jacob_bot));
 }
 
+
+// ---------- permanent record, revisions, doc versions, recent window, transcripts ----------
+await runPermanentTests({ call, dylanS, jacobS, check, tag });
+
+// ---------- webhooks (local receiver over http://localhost, allowed only in the box version) ----------
+{
+  const http = await import("node:http");
+  const inbox = [];
+  const srv = http.createServer((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { inbox.push({ bot: new URL(req.url, "http://x").searchParams.get("bot"), body: b, sig: req.headers["x-ffw-signature"] }); res.writeHead(204).end(); }); });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const port = srv.address().port;
+  const receiver = { url: (bot) => `http://127.0.0.1:${port}/hook?bot=${bot}`, read: async () => [...inbox], clear: async () => { inbox.length = 0; } };
+  const badUrls = ["https://10.0.0.1/hook", "https://192.168.1.10/hook", "https://169.254.169.254/latest/meta-data", "https://metadata.google.internal/", "http://example.com/hook", "ftp://example.com/x", "https://[::ffff:7f00:1]/hook", "https://[fd00::1]/hook"];
+  globalThis.webhookResults = await runWebhookTests({ call, human: { dylan: dylanS, jacob: jacobS }, check, sleep, receiver, badUrls, tag });
+  srv.close();
+}
+
 // ---------- browser UI ----------
 const browser = await puppeteer.launch({ executablePath: CHROME, args: ["--no-sandbox"] });
 async function uiLogin(page, id, pin) {
@@ -240,7 +259,7 @@ try {
   await pd.waitForSelector("#feed");
   check("UI: human sign-in (pick name + PIN)", (await pd.$eval("#me-name", (e) => e.textContent)) === "Dylan");
   const navD = await pd.$$eval("#rooms button", (b) => b.map((x) => x.textContent.trim()));
-  check("UI: human sidebar has 4 rooms", navD.join("|") === "Talk|Work|Documents|Owners only", navD.join(", "));
+  check("UI: human sidebar has 4 rooms + Settings", navD.join("|") === "Talk|Work|Documents|Owners only|Settings", navD.join(", "));
   await pd.type("#body", `@dylans-bot draft the weekly field summary ${tag}`); await pd.keyboard.press("Enter");
   await pd.waitForFunction((t) => [...document.querySelectorAll(".msg")].some((m) => m.innerText.includes(t) && m.innerText.includes("command → Dylan")), {}, `weekly field summary ${tag}`);
   check("UI: Talk message appears live with author, time and command badge", true);
@@ -267,6 +286,30 @@ try {
   const wchk = (await call("dylan_bot", "GET", `/api/rooms/work/messages?after=${wid - 1}`)).data.messages[0];
   check("UI: Work post created with assignee, status changed to In progress", wchk.status === "in_progress" && wchk.assignee === "jacob");
   await pd.screenshot({ path: join(SHOTS, "desktop-work.png") });
+
+  // permanent record UI: change history, recent-50 window, Load older, Full transcript page
+  const histOk = await pd.waitForSelector(`.msg[data-id="${wid}"] [data-hist]`, { timeout: 15000 }).then(() => true).catch(() => false);
+  if (histOk) { await clickJs(pd, `.msg[data-id="${wid}"] [data-hist]`); await pd.waitForFunction((i) => /In progress/.test(document.querySelector(`.msg[data-id="${i}"] .hist`)?.textContent || ""), { timeout: 8000 }, wid).catch(() => {}); }
+  check("UI: work post History shows the status change", histOk && /To do → In progress/.test(await pd.$eval(`.msg[data-id="${wid}"] .hist`, (e) => e.textContent).catch(() => "")));
+  await pd.click('#rooms button[data-room="talk"]'); await pd.waitForSelector("#load-older", { timeout: 10000 }).catch(() => {});
+  const n0 = await pd.$$eval("#feed .msg", (m) => m.length);
+  const tlink = await pd.$eval("#transcript-link", (e) => ({ href: e.getAttribute("href"), hidden: e.classList.contains("hidden") }));
+  check("UI: Talk opens with only the recent 50 + Load older + Full transcript link", n0 >= 50 && n0 <= 53 && !!(await pd.$("#load-older")) && !tlink.hidden && tlink.href === "/transcript.html?room=talk", `${n0} shown`);
+  await clickJs(pd, "#load-older"); await pd.waitForFunction((n) => document.querySelectorAll("#feed .msg").length > n, { timeout: 10000 }, n0).catch(() => {});
+  const n1 = await pd.$$eval("#feed .msg", (m) => m.length);
+  check("UI: Load older prepends earlier messages", n1 > n0, `${n0} → ${n1}`);
+  await pd.goto(BASE + "/transcript.html?room=talk&pageSize=20", { waitUntil: "networkidle0" });
+  await pd.waitForSelector("#t-feed .msg", { timeout: 10000 }).catch(() => {});
+  const tp = await pd.$eval("#t-page", (e) => e.textContent).catch(() => "");
+  const latest = (await call("dylan_bot", "GET", "/api/rooms/talk/messages?limit=1")).data.messages[0];
+  const lastOk = await pd.$$eval("#t-feed .msg .body", (b, t) => b.at(-1)?.textContent === t, latest.body).catch(() => false);
+  check("UI: Full transcript page opens on the latest page, paginated", /^Page (\d+) of \1$/.test(tp) && !tp.startsWith("Page 1 ") && lastOk, tp);
+  await pd.screenshot({ path: join(SHOTS, "desktop-transcript.png") });
+  await clickJs(pd, "#t-first"); await pd.waitForFunction(() => /^Page 1 of/.test(document.querySelector("#t-page").textContent), { timeout: 8000 }).catch(() => {});
+  check("UI: transcript paging to the first page", /^Page 1 of/.test(await pd.$eval("#t-page", (e) => e.textContent)));
+  await pd.goto(BASE + "/transcript.html?room=owners", { waitUntil: "networkidle0" }); await pd.waitForSelector("#t-feed .msg", { timeout: 8000 }).catch(() => {});
+  check("UI: Owners only transcript visible to an owner", (await pd.$eval("#t-title", (e) => e.textContent)).startsWith("Owners only"));
+  await pd.goto(BASE + "/", { waitUntil: "networkidle0" }); await pd.waitForSelector("#feed");
 
   // owners
   await pd.click('#rooms button[data-room="owners"]'); await pd.waitForSelector("#feed"); await sleep(300);
@@ -312,6 +355,12 @@ try {
   const navB = await pb.$$eval("#rooms button", (b) => b.map((x) => x.textContent.trim()));
   check("UI: bot sign-in has no Owners only room", !navB.includes("Owners only") && navB.length === 3, navB.join(", "));
   await pb.screenshot({ path: join(SHOTS, "desktop-bot-view.png") });
+  await clickJs(pd, '#rooms button[data-room="settings"]'); await pd.waitForSelector("#settings");
+  const editable = await pd.$$eval("#settings .hook-url", (e) => e.length);
+  const dylanCard = await pd.$eval('#settings [data-bot="dylan_bot"]', (e) => !!e.querySelector(".hook-url"));
+  const jacobCard = await pd.$eval('#settings [data-bot="jacob_bot"]', (e) => e.innerText);
+  check("UI: Settings shows Dylan an editable webhook for Dylan's Bot only", editable === 1 && dylanCard && /Only Jacob can change this/.test(jacobCard));
+  await pd.screenshot({ path: join(SHOTS, "desktop-settings.png") });
 
   // mobile
   const pm = await ctxD.newPage();
@@ -333,5 +382,6 @@ try {
   await browser.close();
 }
 const failed = results.filter((r) => !r.ok);
+if (globalThis.webhookResults) for (const [bot, r] of Object.entries(globalThis.webhookResults)) console.log(`webhooks ${bot}: ${r.filter((x) => x.ok).length}/${r.length} passed`);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
 process.exit(failed.length ? 1 : 0);

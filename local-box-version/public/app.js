@@ -63,6 +63,10 @@
       const b = document.createElement("button"); b.dataset.room = r.id; b.className = r.id === state.room ? "active" : "";
       b.innerHTML = `<span class="dot"></span>${esc(r.name)}`; b.onclick = () => openRoom(r.id); nav.appendChild(b);
     }
+    if (state.me.type === "human") {
+      const b = document.createElement("button"); b.dataset.room = "settings"; b.className = state.room === "settings" ? "active" : "";
+      b.innerHTML = `<span class="dot"></span>Settings`; b.onclick = () => openSettings(); nav.appendChild(b);
+    }
   }
   $("#people-filter").onchange = (e) => { state.filter = e.target.value; openRoom(state.room); };
 
@@ -76,13 +80,15 @@
   }
 
   async function openRoom(id) {
+    if (id === "settings") return openSettings();
     state.room = id; state.editing = false; renderNav(); $("#toast").classList.add("hidden");
     const r = state.rooms.find((x) => x.id === id);
     $("#room-title").textContent = r.name; $("#room-desc").textContent = r.description;
+    const tl = $("#transcript-link"); tl.classList.toggle("hidden", r.kind === "docs"); tl.href = `/transcript.html?room=${r.id}`;
     if (r.kind === "docs") return loadDocs();
-    const q = new URLSearchParams({ limit: "200" }); if (state.filter) q.set("author", state.filter);
-    const { messages } = await api(`/api/rooms/${id}/messages?${q}`);
-    state.messages = messages;
+    const q = new URLSearchParams({ limit: "50" }); if (state.filter) q.set("author", state.filter);
+    const { messages, hasMore } = await api(`/api/rooms/${id}/messages?${q}`);
+    state.messages = messages; state.hasMore = hasMore;
     renderChat(r);
   }
 
@@ -129,7 +135,8 @@
     const feed = $("#feed"); if (!feed) return;
     const work = state.room === "work";
     if (!state.messages.length) { feed.innerHTML = `<p class="empty">${state.filter ? "No posts from " + esc(nameOf(state.filter)) + " here yet." : "Nothing here yet."}</p>`; return; }
-    feed.innerHTML = state.messages.map((m) => `
+    const older = state.hasMore ? `<div class="toolbar" style="justify-content:center"><button class="ghost small" id="load-older">Load older</button> <a class="ghost small" href="/transcript.html?room=${state.room}">Full transcript</a></div>` : "";
+    feed.innerHTML = older + state.messages.map((m) => `
       <article class="msg ${work ? "status-" + m.status : ""}" data-id="${m.id}">
         <div class="meta"><span class="who ${m.author}">${esc(m.authorName)}</span>${isBotId(m.author) ? `<span class="badge bot">bot</span>` : ""}
           <time class="when" datetime="${new Date(m.createdAt).toISOString()}">${fmtTime(m.createdAt)}</time>
@@ -139,14 +146,69 @@
         ${work ? `<div class="work-ctrls">
           <label>Status <select data-act="status">${Object.entries(STATUS).map(([k, v]) => `<option value="${k}" ${k === m.status ? "selected" : ""}>${v}</option>`).join("")}</select></label>
           <label>Assigned to <select data-act="assignee">${memberOptions(m.assignee, true)}</select></label>
-          ${m.updatedAt !== m.createdAt ? `<span class="muted">updated ${fmtTime(m.updatedAt)}</span>` : ""}</div>` : ""}
+          ${m.updatedAt !== m.createdAt ? `<span class="muted">updated ${fmtTime(m.updatedAt)}</span> <button class="ghost small" data-hist="${m.id}">History</button>` : ""}</div><div class="hist muted"></div>` : ""}
       </article>`).join("");
     if (work) feed.querySelectorAll("select[data-act]").forEach((sel) => sel.onchange = async () => {
       const id = sel.closest(".msg").dataset.id;
       try { await api(`/api/messages/${id}`, { method: "PATCH", body: JSON.stringify({ [sel.dataset.act]: sel.value || null }) }); }
       catch (err) { toast(err.message, true); }
     });
+    feed.querySelectorAll("[data-hist]").forEach((b) => b.onclick = async () => {
+      const box = b.closest(".msg").querySelector(".hist");
+      const { history } = await api(`/api/messages/${b.dataset.hist}/history`);
+      const fmt = (k, v) => (k === "status" ? STATUS[v] || v : nameOf(v) || "Unassigned");
+      box.innerHTML = history.map((h) => `<div>${fmtTime(h.at)} · ${esc(h.actorName)}: ${Object.entries(h.changes).map(([k, [a, b2]]) => `${k} ${esc(fmt(k, a))} → ${esc(fmt(k, b2))}`).join(", ")}</div>`).join("") || "No changes.";
+    });
+    const lo = $("#load-older");
+    if (lo) lo.onclick = async () => {
+      const q = new URLSearchParams({ limit: "50", before: String(state.messages[0]?.id || 0) }); if (state.filter) q.set("author", state.filter);
+      const room = state.room, prevH = feed.scrollHeight;
+      const { messages, hasMore } = await api(`/api/rooms/${room}/messages?${q}`);
+      if (room !== state.room) return;
+      state.messages = [...messages.filter((m) => !state.messages.some((x) => x.id === m.id)), ...state.messages]; state.hasMore = hasMore;
+      renderFeed(false); feed.scrollTop = feed.scrollHeight - prevH;
+    };
     if (scroll) feed.scrollTop = feed.scrollHeight;
+  }
+
+
+  // ---------- settings: bot webhooks (humans only) ----------
+  async function openSettings() {
+    state.room = "settings"; state.editing = false; renderNav(); $("#transcript-link").classList.add("hidden"); $("#toast").classList.add("hidden");
+    $("#room-title").textContent = "Settings"; $("#room-desc").textContent = "Bot webhooks: get a short notice when something targets a bot.";
+    let data;
+    try { data = await api("/api/webhooks"); } catch (err) { $("#view").innerHTML = `<p class="empty">${esc(err.message)}</p>`; return; }
+    const card = (w) => `<section class="sugg" data-bot="${w.botId}">
+        <h3>${esc(w.botName)} webhook</h3>
+        <p class="muted">Managed by ${esc(w.managedByName)}. Status: ${w.configured ? "set" : "not set"}${w.lastDelivery ? ` · last delivery <b>${esc(w.lastDelivery.status)}</b>${w.lastDelivery.error ? " (" + esc(w.lastDelivery.error) + ")" : ""} for ${esc(w.lastDelivery.type)} at ${fmtTime(w.lastDelivery.at)}` : ""}</p>
+        ${w.canEdit ? `<div class="row" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+            <input class="hook-url" style="flex:1;min-width:220px" type="url" placeholder="https://your-bot.example.com/hook" value="${esc(w.url || "")}">
+            <button class="brass small" data-act="save">Save</button>
+            <button class="small" data-act="test" ${w.configured ? "" : "disabled"}>Send test</button>
+            <button class="danger small" data-act="clear" ${w.configured ? "" : "disabled"}>Clear</button></div>
+          <p class="muted hook-secret"></p>` : `<p class="muted">Only ${esc(w.managedByName)} can change this.</p>`}
+      </section>`;
+    $("#view").innerHTML = `<div class="docpane" id="settings">
+      <p class="muted">Notices are sent for: @mentions and bot handoffs, Work posts assigned to the bot, suggestions on the bot's docs (and decisions on its suggestions), and any message from Dylan or Jacob. Never for Owners only, never for the bot's own actions. Payload: <code>{type, room, itemId, author, time}</code>, no message text.</p>
+      ${data.webhooks.map(card).join("")}</div>`;
+    document.querySelectorAll("#settings [data-act]").forEach((b) => b.onclick = async () => {
+      const sec = b.closest("[data-bot]"), bot = sec.dataset.bot;
+      try {
+        if (b.dataset.act === "save") {
+          const r = await api(`/api/webhooks/${bot}`, { method: "PUT", body: JSON.stringify({ url: sec.querySelector(".hook-url").value }) });
+          await openSettings();
+          const out = document.querySelector(`#settings [data-bot="${bot}"] .hook-secret`);
+          if (out) out.innerHTML = `Signing secret (shown once, copy it now): <code class="secret-once">${esc(r.secret)}</code><br>Each notice has <code>X-FFW-Signature: sha256=HMAC(secret, body)</code>.`;
+          toast("Webhook saved.");
+        } else if (b.dataset.act === "clear") {
+          await api(`/api/webhooks/${bot}`, { method: "DELETE" }); toast("Webhook cleared."); openSettings();
+        } else {
+          const r = await api(`/api/webhooks/${bot}/test`, { method: "POST" });
+          toast(r.result.ok ? `Test delivered (${r.result.status}).` : `Test failed: ${r.result.status}${r.result.error ? " - " + r.result.error : ""}`, !r.result.ok);
+          openSettings();
+        }
+      } catch (err) { toast(err.message, true); }
+    });
   }
 
   // ---------- documents ----------
@@ -189,10 +251,16 @@
     pane.innerHTML = `<h3>${esc(doc.title)}</h3>
       <p class="muted">Owner: <span class="who ${doc.owner}">${esc(doc.ownerName)}</span> · last change ${fmtTime(doc.updatedAt)} by ${esc(nameOf(doc.updatedBy))}</p>
       <div class="docbody">${esc(doc.body) || '<span class="muted">(empty)</span>'}</div>
-      <div class="toolbar"><button class="brass small" id="edit-doc">${owner ? "Edit" : "Suggest an edit"}</button></div>
+      <div class="toolbar"><button class="brass small" id="edit-doc">${owner ? "Edit" : "Suggest an edit"}</button><button class="ghost small" id="doc-versions">Version history</button></div>
+      <div id="versions"></div>
       ${pending.length ? `<h4>Pending suggestions</h4>${pending.map(sugHtml).join("")}` : ""}
       ${done.length ? `<h4 class="muted">History</h4>${done.map(sugHtml).join("")}` : ""}`;
     $("#edit-doc").onclick = () => renderEditor(d);
+    $("#doc-versions").onclick = async () => {
+      const { versions } = await api(`/api/docs/${doc.id}/versions`);
+      const src = { create: "created", edit: "edited by owner", suggestion: "accepted suggestion", existing: "saved" };
+      $("#versions").innerHTML = `<h4>All versions (kept permanently)</h4>` + versions.map((v) => `<details class="sugg"><summary>v${v.version} · ${esc(v.title)} · ${esc(src[v.source] || v.source)} · ${esc(v.authorName)} · ${fmtTime(v.at)}</summary><div class="docbody">${esc(v.body) || '<span class="muted">(empty)</span>'}</div></details>`).join("");
+    };
     pane.querySelectorAll(".sugg [data-act]").forEach((b) => b.onclick = async () => {
       const sid = b.closest(".sugg").dataset.sid;
       try { const r = await api(`/api/suggestions/${sid}/${b.dataset.act}`, { method: "POST" }); toast(`Suggestion ${r.suggestion.status}.${r.staleBase ? " (Doc had changed since it was made.)" : ""}`); loadDocs(doc.id); }

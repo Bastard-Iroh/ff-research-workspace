@@ -5,3 +5,6 @@ screenshots
 data
 scripts
 archive
+.admin-secret*
+.sink-token*
+.bypass-secret*

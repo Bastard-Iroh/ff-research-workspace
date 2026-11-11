@@ -4,10 +4,13 @@ import cookieSession from "cookie-session";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { Readable } from "node:stream";
 import { readFileSync } from "node:fs";
+import { lookup as dnsLookup } from "node:dns/promises";
 import { put, get as blobGet, del as blobDel } from "@vercel/blob";
 import { q, one, nums, attemptLogin, memberRow, SCHEMA } from "./lib/db.js";
 import { member, listMembers, resolveMember, isBot, isHuman, refreshNames, validateBotName, MEMBER_IDS } from "./lib/members.js";
 import { checkSensitive } from "./lib/filter.js";
+import { waitUntil } from "@vercel/functions";
+import { BOTS, deliver, newSecret, validateWebhookUrl, noticesForMessage, noticesForReassign, noticesForSuggestion, noticesForDecision } from "./lib/webhooks.js";
 
 const MAX_FILE = 4 * 1024 * 1024;
 const MAX_BODY = 8000;
@@ -178,7 +181,7 @@ async function commandRules(author, mentions, roomId) {
 const api = express.Router();
 app.use("/api", api);
 const jsonParser = express.json({ limit: "512kb" });
-api.use((req, res, next) => (/\/files$/.test(req.path) ? next() : jsonParser(req, res, next)));
+api.use((req, res, next) => (/\/files$|^\/webhook-test-sink\//.test(req.path) ? next() : jsonParser(req, res, next)));
 
 api.get("/session", wrap(async (req, res) => {
   const a = await authenticate(req);
@@ -195,6 +198,16 @@ api.post("/login", wrap(async (req, res) => {
   res.json({ user: member(id) });
 }));
 api.post("/logout", (req, res) => { req.session = null; res.json({ ok: true }); });
+
+// ---------- webhook test sink (verification only) ----------
+// Active only while WEBHOOK_TEST_SINK_TOKEN is set; stores the raw notice so scripts/verify.mjs can read it via /api/admin.
+api.post("/webhook-test-sink/:token", express.text({ type: () => true, limit: "8kb" }), wrap(async (req, res) => {
+  const want = process.env.WEBHOOK_TEST_SINK_TOKEN || "";
+  const a = createHash("sha256").update(want).digest(), b = createHash("sha256").update(req.params.token || "").digest();
+  if (want.length < 24 || !timingSafeEqual(a, b)) return res.status(404).json({ error: "Not found." });
+  await q("INSERT INTO webhook_test_inbox (received_at, signature, event, tag, body) VALUES ($1,$2,$3,$4,$5)", [Date.now(), req.get("X-FFW-Signature") || null, req.get("X-FFW-Event") || null, String(req.query.bot || "").slice(0, 40), String(req.body || "")]);
+  res.status(204).end();
+}));
 
 // ---------- operator endpoint (box admin CLI only) ----------
 // The box can't open Postgres connections directly, so scripts/admin.mjs calls this with ADMIN_SECRET.
@@ -219,6 +232,18 @@ api.post("/admin", wrap(async (req, res) => {
       }
       return res.json({ ok: true, seeded });
     }
+    case "resolve": { // operator diagnostics for the webhook SSRF guard
+      try { return res.json({ addresses: await dnsLookup(String(req.body.host || ""), { all: true, verbatim: true }) }); }
+      catch (e) { return res.json({ error: e.code || e.message }); }
+    }
+    case "sink-read":
+      return res.json({ inbox: (await q("SELECT * FROM webhook_test_inbox ORDER BY id")).map(nums) });
+    case "sink-clear":
+      await q("DELETE FROM webhook_test_inbox");
+      return res.json({ ok: true });
+    case "webhooks-clear":
+      await q("DELETE FROM webhooks");
+      return res.json({ ok: true });
     case "list":
       return res.json({ members: (await q("SELECT id, name, handle, pin_version, failed, locked_until FROM members ORDER BY id")).map(nums) });
     case "unlock":
@@ -247,9 +272,11 @@ api.post("/admin", wrap(async (req, res) => {
       return Readable.fromWeb(b.stream).pipe(res);
     }
     case "clear-content": {
+      // Permanent record: production content can never be cleared. Only preview/test databases can be reset.
+      if (process.env.VERCEL_ENV === "production") return res.status(405).json({ error: "Production content is permanent.", code: "permanent_record" });
       const files = await q("SELECT stored FROM files");
       if (files.length) await blobDel(files.map((f) => f.stored));
-      await q("DELETE FROM suggestions; DELETE FROM docs; DELETE FROM messages; DELETE FROM files;");
+      await q("DELETE FROM revisions; DELETE FROM doc_versions; DELETE FROM suggestions; DELETE FROM docs; DELETE FROM messages; DELETE FROM files; DELETE FROM webhook_test_inbox;");
       return res.json({ ok: true, blobsRemoved: files.length });
     }
     default:
@@ -258,6 +285,67 @@ api.post("/admin", wrap(async (req, res) => {
 }));
 
 api.use(requireAuth);
+
+// ---------- bot webhooks ----------
+// Live version: https only. Delivery runs after the response via waitUntil (fire-and-forget).
+const HOOK_OPTS = { allowLocalHttp: false };
+const hookRow = async (bot) => nums(await one("SELECT * FROM webhooks WHERE bot_id = $1", [bot]));
+const saveHookStatus = (bot, r) => q("UPDATE webhooks SET last_status = $1, last_error = $2, last_type = $3, last_at = $4 WHERE bot_id = $5", [r.status, r.error, r.type, r.at, bot]);
+function notify(notices) {
+  if (!notices.length) return;
+  const time = Date.now();
+  waitUntil((async () => {
+    const hooks = await q("SELECT * FROM webhooks WHERE bot_id = ANY($1)", [notices.map((n) => n.bot)]);
+    await Promise.all(notices.map(async (n) => {
+      const h = hooks.find((x) => x.bot_id === n.bot);
+      if (!h?.url) return;
+      const r = await deliver(h, { ...n, time }, HOOK_OPTS);
+      await saveHookStatus(n.bot, r);
+    }));
+  })().catch((e) => console.error("webhook", e.message)));
+}
+async function hookOut(bot, viewer, h) {
+  h ??= (await hookRow(bot)) || {};
+  const canEdit = BOTS[bot] === viewer.id;
+  return { botId: bot, botName: member(bot).name, managedBy: BOTS[bot], managedByName: member(BOTS[bot]).name, canEdit, configured: !!h.url,
+    url: canEdit ? h.url || null : null, lastDelivery: h.last_at ? { status: h.last_status, error: h.last_error, type: h.last_type, at: h.last_at } : null };
+}
+function hookGuard(req, res, write) {
+  if (!isHuman(req.user.id)) { res.status(403).json({ error: "Bots can't view or change webhooks." }); return null; }
+  if (!write) return true;
+  const bot = resolveMember(req.params.bot);
+  if (!BOTS[bot]) { res.status(404).json({ error: "No such bot." }); return null; }
+  if (BOTS[bot] !== req.user.id) { res.status(403).json({ error: `Only ${member(BOTS[bot]).name} can change ${member(bot).name}'s webhook.` }); return null; }
+  return bot;
+}
+api.get("/webhooks", wrap(async (req, res) => {
+  if (!hookGuard(req, res, false)) return;
+  const rows = (await q("SELECT * FROM webhooks")).map(nums);
+  res.json({ webhooks: await Promise.all(Object.keys(BOTS).map((b) => hookOut(b, req.user, rows.find((r) => r.bot_id === b) || {}))) });
+}));
+api.put("/webhooks/:bot", wrap(async (req, res) => {
+  const bot = hookGuard(req, res, true); if (!bot) return;
+  let url;
+  try { url = await validateWebhookUrl(req.body?.url, HOOK_OPTS); } catch (e) { return res.status(400).json({ error: e.message, code: "bad_webhook_url" }); }
+  const secret = newSecret();
+  await q(`INSERT INTO webhooks (bot_id, url, secret, updated_by, updated_at) VALUES ($1,$2,$3,$4,$5)
+    ON CONFLICT (bot_id) DO UPDATE SET url = EXCLUDED.url, secret = EXCLUDED.secret, updated_by = EXCLUDED.updated_by, updated_at = EXCLUDED.updated_at,
+    last_status = NULL, last_error = NULL, last_type = NULL, last_at = NULL`, [bot, url, secret, req.user.id, Date.now()]);
+  res.json({ webhook: await hookOut(bot, req.user), secret, secretNote: "Shown once. Use it to check the X-FFW-Signature header (HMAC-SHA256 of the raw body)." });
+}));
+api.delete("/webhooks/:bot", wrap(async (req, res) => {
+  const bot = hookGuard(req, res, true); if (!bot) return;
+  await q("DELETE FROM webhooks WHERE bot_id = $1", [bot]);
+  res.json({ webhook: await hookOut(bot, req.user, {}) });
+}));
+api.post("/webhooks/:bot/test", wrap(async (req, res) => {
+  const bot = hookGuard(req, res, true); if (!bot) return;
+  const h = await hookRow(bot);
+  if (!h?.url) return res.status(400).json({ error: "Set a webhook URL first." });
+  const r = await deliver(h, { type: "test", room: null, itemId: null, author: req.user.id, time: Date.now() }, HOOK_OPTS);
+  await saveHookStatus(bot, r);
+  res.json({ result: { ok: r.ok, status: r.status, error: r.error, attempts: r.attempts }, webhook: await hookOut(bot, req.user) });
+}));
 
 api.get("/whoami", (req, res) => {
   const u = req.user;
@@ -269,7 +357,7 @@ api.get("/rooms", (req, res) => res.json({ rooms: Object.values(ROOMS).filter((r
 api.get("/rooms/:room/messages", wrap(async (req, res) => {
   const room = roomAccess(req, res, req.params.room); if (!room) return;
   if (!MESSAGE_ROOMS.includes(room.id)) return res.status(400).json({ error: "Documents has no messages; use /api/docs." });
-  const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
+  const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 500);
   const where = ["m.room = $1"]; const args = [room.id];
   const add = (sql, v) => { args.push(v); where.push(sql.replace("?", `$${args.length}`)); };
   if (req.query.after) add("m.id > ?", Number(req.query.after));
@@ -278,10 +366,34 @@ api.get("/rooms/:room/messages", wrap(async (req, res) => {
   if (req.query.author) { const a = resolveMember(req.query.author); if (!a) return res.status(400).json({ error: "Unknown author." }); add("m.author = ?", a); }
   if (req.query.status && room.id === "work") add("m.status = ?", String(req.query.status));
   const asc = req.query.after || req.query.since;
-  args.push(limit);
+  args.push(limit + 1);
   let rows = await q(`${MSG_SELECT} WHERE ${where.join(" AND ")} ORDER BY m.id ${asc ? "ASC" : "DESC"} LIMIT $${args.length}`, args);
+  const hasMore = rows.length > limit;
+  rows = rows.slice(0, limit);
   if (!asc) rows = rows.reverse();
-  res.json({ room: room.id, messages: rows.map((r) => messageOut(r, req.user)), serverTime: Date.now() });
+  res.json({ room: room.id, messages: rows.map((r) => messageOut(r, req.user)), hasMore, serverTime: Date.now() });
+}));
+
+// Full transcript: every message in a room, oldest first, paginated. Owners only stays 403 for bots.
+const revisionOut = (v) => ({ id: v.id, actor: v.actor, actorName: member(v.actor)?.name, changes: JSON.parse(v.changes), at: Number(v.at) });
+api.get("/rooms/:room/transcript", wrap(async (req, res) => {
+  const room = roomAccess(req, res, req.params.room); if (!room) return;
+  if (!MESSAGE_ROOMS.includes(room.id)) return res.status(400).json({ error: "Documents has no transcript; see /api/docs/:id/versions." });
+  const pageSize = Math.min(Math.max(Number(req.query.pageSize) || 100, 1), 200);
+  const total = (await one("SELECT COUNT(*)::int AS c FROM messages WHERE room = $1", [room.id])).c;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const page = Math.min(Math.max(Number(req.query.page) || 1, 1), totalPages);
+  const rows = await q(`${MSG_SELECT} WHERE m.room = $1 ORDER BY m.id ASC LIMIT $2 OFFSET $3`, [room.id, pageSize, (page - 1) * pageSize]);
+  const ids = rows.filter((r) => r.room === "work").map((r) => r.id);
+  const revs = ids.length ? await q("SELECT * FROM revisions WHERE message_id = ANY($1) ORDER BY id", [ids]) : [];
+  res.json({ room: room.id, roomName: room.name, page, pageSize, total, totalPages,
+    messages: rows.map((r) => ({ ...messageOut(r, req.user), history: revs.filter((v) => v.message_id === r.id).map(revisionOut) })) });
+}));
+api.get("/messages/:id/history", wrap(async (req, res) => {
+  const row = await one(`${MSG_SELECT} WHERE m.id = $1`, [Number(req.params.id) || 0]);
+  if (!row) return res.status(404).json({ error: "No such message." });
+  if (!roomAccess(req, res, row.room)) return;
+  res.json({ message: messageOut(row, req.user), history: (await q("SELECT * FROM revisions WHERE message_id = $1 ORDER BY id", [row.id])).map(revisionOut) });
 }));
 
 async function createMessage(req, res, roomId, body, extra = {}) {
@@ -298,7 +410,9 @@ async function createMessage(req, res, roomId, body, extra = {}) {
   const ins = await one(`INSERT INTO messages (room, author, body, mentions, commands, status, assignee, file_id, created_at, updated_at)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) RETURNING id`,
     [roomId, req.user.id, body, JSON.stringify(mentions), JSON.stringify(rules.commands), status, assignee, extra.fileId ?? null, now]);
-  return one(`${MSG_SELECT} WHERE m.id = $1`, [ins.id]);
+  const row = await one(`${MSG_SELECT} WHERE m.id = $1`, [ins.id]);
+  notify(noticesForMessage(row));
+  return row;
 }
 
 api.post("/rooms/:room/messages", wrap(async (req, res) => {
@@ -324,7 +438,13 @@ api.patch("/messages/:id", wrap(async (req, res) => {
     else { assignee = resolveMember(req.body.assignee); if (!assignee) return res.status(400).json({ error: "Unknown assignee." }); }
   }
   await q("UPDATE messages SET status = $1, assignee = $2, updated_at = $3 WHERE id = $4", [status, assignee, Date.now(), row.id]);
-  res.json({ message: messageOut(await one(`${MSG_SELECT} WHERE m.id = $1`, [row.id]), req.user) });
+  const changes = {};
+  if (status !== row.status) changes.status = [row.status, status];
+  if (assignee !== row.assignee) changes.assignee = [row.assignee, assignee];
+  if (Object.keys(changes).length) await q("INSERT INTO revisions (message_id, actor, changes, at) VALUES ($1,$2,$3,$4)", [row.id, req.user.id, JSON.stringify(changes), Date.now()]);
+  const updated = await one(`${MSG_SELECT} WHERE m.id = $1`, [row.id]);
+  notify(noticesForReassign(updated, row.assignee, req.user.id));
+  res.json({ message: messageOut(updated, req.user) });
 }));
 
 // ---------- files (private Vercel Blob) ----------
@@ -341,7 +461,7 @@ api.post("/rooms/:room/files", express.raw({ type: () => true, limit: MAX_FILE }
   const rules = await commandRules(req.user.id, parseMentions(caption), room.id);
   if (rules.error) return res.status(rules.status).json({ error: rules.error, code: rules.code });
   const mime = String(req.get("Content-Type") || "application/octet-stream").split(";")[0].slice(0, 100);
-  const pathname = `files/${room.id}/${randomBytes(16).toString("hex")}`;
+  const pathname = `${process.env.VERCEL_ENV === "production" ? "" : "test/"}files/${room.id}/${randomBytes(16).toString("hex")}`;
   await put(pathname, buf, { access: "private", contentType: "application/octet-stream", addRandomSuffix: false });
   const f = await one("INSERT INTO files (room, uploader, name, mime, size, stored, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
     [room.id, req.user.id, name, mime, buf.length, pathname, Date.now()]);
@@ -361,6 +481,16 @@ api.get("/files/:id", wrap(async (req, res) => {
 }));
 
 // ---------- documents ----------
+// Permanent record: every saved state of a doc is kept as a numbered version.
+const saveVersion = (docId, title, body, author, source, suggestionId, at) => q(
+  `INSERT INTO doc_versions (doc_id, version, title, body, author, source, suggestion_id, at)
+   SELECT $1, COALESCE(MAX(version), 0) + 1, $2, $3, $4, $5, $6, $7 FROM doc_versions WHERE doc_id = $1`, [docId, title, body, author, source, suggestionId, at]);
+api.get("/docs/:id/versions", wrap(async (req, res) => {
+  const d = await one("SELECT id FROM docs WHERE id = $1", [Number(req.params.id) || 0]);
+  if (!d) return res.status(404).json({ error: "No such document." });
+  res.json({ versions: (await q("SELECT * FROM doc_versions WHERE doc_id = $1 ORDER BY version DESC", [d.id]))
+    .map((v) => ({ version: v.version, title: v.title, body: v.body, author: v.author, authorName: member(v.author)?.name, source: v.source, suggestionId: v.suggestion_id, at: Number(v.at) })) });
+}));
 api.get("/docs", wrap(async (req, res) => {
   const o = req.query.owner ? resolveMember(req.query.owner) : null;
   const rows = o ? await q(`${DOC_SELECT} WHERE d.owner = $1 ORDER BY d.updated_at DESC`, [o]) : await q(`${DOC_SELECT} ORDER BY d.updated_at DESC`);
@@ -374,6 +504,7 @@ api.post("/docs", wrap(async (req, res) => {
   if (blocked(res, title, body)) return;
   const now = Date.now();
   const d = await one("INSERT INTO docs (title, body, owner, created_at, updated_at, updated_by) VALUES ($1,$2,$3,$4,$4,$3) RETURNING *, 0 AS pending", [title, body, req.user.id, now]);
+  await saveVersion(d.id, title, body, req.user.id, "create", null, now);
   res.status(201).json({ doc: { ...docSummary(d), body: d.body } });
 }));
 async function getDocOr404(req, res) {
@@ -395,6 +526,7 @@ async function makeSuggestion(req, res, d) {
   if (blocked(res, title, body, note)) return;
   const s = await one(`INSERT INTO suggestions (doc_id, author, base_title, base_body, title, body, note, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
     [d.id, req.user.id, d.title, d.body, title, body, note, Date.now()]);
+  notify(noticesForSuggestion(d, req.user.id));
   res.status(202).json({ suggested: true, suggestion: suggestionOut(s), message: `You don't own this doc, so your edit was saved as a suggestion for ${member(d.owner).name} to accept or reject.` });
 }
 api.put("/docs/:id", wrap(async (req, res) => {
@@ -404,7 +536,9 @@ api.put("/docs/:id", wrap(async (req, res) => {
   const body = String(req.body?.body ?? d.body);
   if (body.length > MAX_DOC) return res.status(400).json({ error: "Document is too long." });
   if (blocked(res, title, body)) return;
-  await q("UPDATE docs SET title = $1, body = $2, updated_at = $3, updated_by = $4 WHERE id = $5", [title, body, Date.now(), req.user.id, d.id]);
+  const at = Date.now();
+  await q("UPDATE docs SET title = $1, body = $2, updated_at = $3, updated_by = $4 WHERE id = $5", [title, body, at, req.user.id, d.id]);
+  await saveVersion(d.id, title, body, req.user.id, "edit", null, at);
   const nd = await one(`${DOC_SELECT} WHERE d.id = $1`, [d.id]);
   res.json({ suggested: false, doc: { ...docSummary(nd), body: nd.body } });
 }));
@@ -428,11 +562,19 @@ api.post("/suggestions/:id/:action", wrap(async (req, res) => {
   const upd = await one("UPDATE suggestions SET status = $1, decided_at = $2, decided_by = $3 WHERE id = $4 AND status = 'pending' RETURNING *",
     [action === "accept" ? "accepted" : "rejected", now, req.user.id, s.id]);
   if (!upd) return res.status(409).json({ error: `Suggestion is already ${s.status}.` });
-  if (action === "accept") await q("UPDATE docs SET title = $1, body = $2, updated_at = $3, updated_by = $4 WHERE id = $5", [s.title, s.body, now, s.author, d.id]);
+  notify(noticesForDecision(d, s.author, req.user.id));
+  if (action === "accept") {
+    await q("UPDATE docs SET title = $1, body = $2, updated_at = $3, updated_by = $4 WHERE id = $5", [s.title, s.body, now, s.author, d.id]);
+    await saveVersion(d.id, s.title, s.body, s.author, "suggestion", s.id, now);
+  }
   const nd = await one(`${DOC_SELECT} WHERE d.id = $1`, [d.id]);
   res.json({ suggestion: suggestionOut(upd), doc: { ...docSummary(nd), body: nd.body }, staleBase: s.base_body !== d.body || s.base_title !== d.title });
 }));
 
+// Permanent record: nothing posted can be deleted, and message text can't be edited.
+const PERMANENT = (_req, res) => res.status(405).set("Allow", "GET, POST, PATCH").json({ error: "Everything posted here is permanent. Messages, work posts, documents, suggestions and files can't be deleted.", code: "permanent_record" });
+api.delete(/^\/(rooms|messages|docs|suggestions|files)(\/.*)?$/, PERMANENT);
+api.put(/^\/messages(\/.*)?$/, PERMANENT);
 api.use((_req, res) => res.status(404).json({ error: "Not found." }));
 api.use((err, _req, res, _next) => {
   if (err.type === "entity.too.large") return res.status(413).json({ error: "Upload is over the 4 MB limit." });

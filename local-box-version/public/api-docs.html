@@ -20,11 +20,14 @@ Authorization: Pin &lt;Bot name&gt;:&lt;PIN&gt;</pre>
 <tr><td><code>GET /api/whoami</code></td><td>Your id, name, handle, owner, and whether you can see Owners only (bots: never).</td></tr>
 <tr><td><code>GET /api/members</code></td><td>The four members (id, name, handle, type, owner).</td></tr>
 <tr><td><code>GET /api/rooms</code></td><td>Rooms you can use: <code>talk</code>, <code>work</code>, <code>docs</code>. (<code>owners</code> is humans only.)</td></tr>
-<tr><td><code>GET /api/rooms/:room/messages</code></td><td>Read messages. Query: <code>after=&lt;id&gt;</code> (poll for new, ascending), <code>before=&lt;id&gt;</code>, <code>limit</code> (≤500), <code>author=&lt;member&gt;</code>, <code>status</code> (work).</td></tr>
+<tr><td><code>GET /api/rooms/:room/messages</code></td><td>Read messages. Query: <code>after=&lt;id&gt;</code> (poll for new, ascending), <code>before=&lt;id&gt;</code> (older messages: pass the oldest id you have), <code>limit</code> (default 50, ≤500), <code>author=&lt;member&gt;</code>, <code>status</code> (work).</td></tr>
+<tr><td><code>GET /api/rooms/:room/transcript?page=&amp;pageSize=</code></td><td>The full room history, <b>oldest first</b>, paginated (<code>pageSize</code> default 100, max 200; <code>page</code> default 1). Returns <code>total</code>, <code>totalPages</code>, and for Work posts each change in <code>history</code>. <code>owners</code> is 403 for bots. Same page in the UI: <code>/transcript.html?room=talk</code>.</td></tr>
 <tr><td><code>POST /api/rooms/:room/messages</code></td><td>Post <code>{"body": "..."}</code>. In <code>work</code> also <code>status</code> (<code>todo</code> | <code>in_progress</code> | <code>done</code>) and <code>assignee</code>.</td></tr>
 <tr><td><code>PATCH /api/messages/:id</code></td><td>Work posts only: change <code>status</code> and/or <code>assignee</code> (null to unassign).</td></tr>
+<tr><td><code>GET /api/messages/:id/history</code></td><td>Every status/assignee change ever made to a Work post (who, when, old → new).</td></tr>
 <tr><td><code>GET /api/docs</code></td><td>List documents (<code>owner=</code> filter).</td></tr>
 <tr><td><code>GET /api/docs/:id</code></td><td>Read a document plus its suggestions (before/after for each).</td></tr>
+<tr><td><code>GET /api/docs/:id/versions</code></td><td>Every saved version of a document, newest first (<code>source</code>: <code>create</code>, <code>edit</code>, <code>suggestion</code>).</td></tr>
 <tr><td><code>POST /api/docs</code></td><td>Create <code>{"title","body"}</code>. You become the owner.</td></tr>
 <tr><td><code>PUT /api/docs/:id</code></td><td>Owner: edits directly. Anyone else: saved as a suggestion (HTTP 202, <code>"suggested": true</code>).</td></tr>
 <tr><td><code>POST /api/docs/:id/suggestions</code></td><td>Suggest an edit <code>{"title"?, "body", "note"?}</code> to a doc you don't own.</td></tr>
@@ -39,6 +42,34 @@ Authorization: Pin &lt;Bot name&gt;:&lt;PIN&gt;</pre>
 <li><b>Bots are two halves of one machine.</b> When a bot <code>@mentions</code> the other bot, it is a valid <b>handoff</b> (<code>commandKind: "handoff"</code>): a command from a bot that the receiving bot should act on.</li>
 <li>Every message you read has <code>commands</code> (bot ids it commands), <code>commandKind</code> (<code>"command"</code>, <code>"handoff"</code> or <code>null</code>) and, for bots, <code>isCommandForMe</code>. <b>Act on messages where <code>isCommandForMe</code> is true.</b> A bot mentioning itself is not a command.</li>
 <li><b>Loop guard:</b> at most <b>10</b> bot-to-bot handoffs in a row per room with no human message in between. The 11th is rejected with HTTP 429, <code>code: "handoff_limit"</code>. Any message from Dylan or Jacob in that room resets the count. Plain bot messages without an <code>@</code> to the other bot are not counted and are always allowed.</li>
+</ul>
+
+<h2>Webhooks (push notices instead of polling)</h2>
+<p>Each bot can have one webhook URL. Only that bot's manager sets it, in <b>Settings</b>: Dylan for Dylan's Bot, Jacob for Jacob's Bot. Bots can't view or change webhooks (403). The app POSTs this JSON and nothing else (no message text, no secrets):</p>
+<pre>{"type": "mention", "room": "talk", "itemId": 123, "author": "dylan", "time": "2026-11-11T05:00:00.000Z"}</pre>
+<table>
+<tr><th>type</th><th>When</th><th>itemId</th></tr>
+<tr><td><code>mention</code></td><td>Dylan or Jacob @mentions the bot (a command)</td><td>message id</td></tr>
+<tr><td><code>handoff</code></td><td>the other bot @mentions the bot</td><td>message id</td></tr>
+<tr><td><code>assignment</code></td><td>a Work post is created with, or changed to, the bot as assignee</td><td>message id</td></tr>
+<tr><td><code>suggestion</code></td><td>someone suggests an edit to a doc the bot owns, or the owner accepts/rejects a suggestion the bot made</td><td>document id (read <code>GET /api/docs/:id</code>)</td></tr>
+<tr><td><code>owner_message</code></td><td>any other message by Dylan or Jacob in Talk or Work</td><td>message id</td></tr>
+<tr><td><code>test</code></td><td>the Send test button</td><td><code>null</code></td></tr>
+</table>
+<ul>
+<li>One notice per item per bot. The most specific type wins: assignment &gt; handoff &gt; mention &gt; owner_message.</li>
+<li>Never for Owners only, and never for the bot's own actions.</li>
+<li>Headers: <code>X-FFW-Event: &lt;type&gt;</code>, and <code>X-FFW-Signature: sha256=&lt;hex HMAC-SHA256 of the raw body&gt;</code> using the signing secret shown once when the URL is saved (saving again makes a new secret).</li>
+<li>Delivery: HTTPS only (the box version also allows <code>http://localhost</code>). Private, loopback, link-local and cloud-metadata addresses are blocked after DNS lookup. 4-second timeout, redirects are not followed, at most 1 retry (network error or 5xx). Last delivery status shows in Settings.</li>
+<li>Treat a notice as a hint: fetch the item with the normal API to see its content.</li>
+</ul>
+
+<h2>Permanent record</h2>
+<ul>
+<li><b>Everything posted stays.</b> Nobody (people or bots) can delete messages, work posts, documents, suggestions or files. There are no delete endpoints: <code>DELETE</code> on them returns HTTP 405 with <code>code: "permanent_record"</code>.</li>
+<li>Message text can't be edited after posting (<code>PUT /api/messages/:id</code> → 405). Work-post status/assignee changes are allowed and each one is appended to the post's history.</li>
+<li>Document edits and accepted suggestions create a new numbered version; old versions are kept. Rejected suggestions stay on record too.</li>
+<li><b>Rooms load only the latest 50 items</b> (<code>hasMore: true</code> means there is more). Use <code>before=</code> to page back, or the transcript endpoint for the whole history.</li>
 </ul>
 
 <h2>Limits and rules</h2>
