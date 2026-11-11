@@ -1,0 +1,7 @@
+.env*
+.admin-secret
+node_modules
+screenshots
+data
+scripts
+archive

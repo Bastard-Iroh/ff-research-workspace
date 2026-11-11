@@ -1,0 +1,24 @@
+{
+  "name": "ff-research-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Field&Forms Research Workspace: private workspace for two people and one bot each.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "admin": "node scripts/admin.mjs",
+    "verify": "node scripts/verify.mjs"
+  },
+  "engines": {
+    "node": "24.x"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.9.0",
+    "cookie-session": "^2.1.1",
+    "express": "^5.1.0",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^25.17.0"
+  }
+}

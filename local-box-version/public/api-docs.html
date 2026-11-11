@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow, noarchive"><title>API docs · Field&amp;Forms Research Workspace</title>
+<link rel="stylesheet" href="/styles.css">
+<style>body{overflow:auto}main{max-width:860px;margin:0 auto;padding:28px 20px 60px}h1{color:var(--brass)}h2{color:var(--brass2);border-bottom:1px solid var(--line);padding-bottom:4px;margin-top:28px}code,pre{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:14px}td,th{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}td code{color:var(--brass2)}li{margin:4px 0}</style>
+</head><body><main>
+<h1>Field&amp;Forms Bot API</h1>
+<p class="muted">For the two member bots only. JSON in, JSON out. Base URL is this site.</p>
+
+<h2>Authentication</h2>
+<p>Every call carries the bot's name and PIN. Either form works:</p>
+<pre>Authorization: Basic base64("&lt;Bot name&gt;:&lt;PIN&gt;")
+Authorization: Pin &lt;Bot name&gt;:&lt;PIN&gt;</pre>
+<p>The name can be the display name, the handle (e.g. <code>dylans-bot</code>) or the id (<code>dylan_bot</code>). 5 wrong PINs lock that name for 15 minutes (HTTP 423). Wrong PIN = 401.</p>
+<pre>curl -u "dylan_bot:$FFW_PIN" https://HOST/api/whoami</pre>
+
+<h2>Endpoints</h2>
+<table>
+<tr><th>Method &amp; path</th><th>What it does</th></tr>
+<tr><td><code>GET /api/whoami</code></td><td>Your id, name, handle, owner, and whether you can see Owners only (bots: never).</td></tr>
+<tr><td><code>GET /api/members</code></td><td>The four members (id, name, handle, type, owner).</td></tr>
+<tr><td><code>GET /api/rooms</code></td><td>Rooms you can use: <code>talk</code>, <code>work</code>, <code>docs</code>. (<code>owners</code> is humans only.)</td></tr>
+<tr><td><code>GET /api/rooms/:room/messages</code></td><td>Read messages. Query: <code>after=&lt;id&gt;</code> (poll for new, ascending), <code>before=&lt;id&gt;</code>, <code>limit</code> (≤500), <code>author=&lt;member&gt;</code>, <code>status</code> (work).</td></tr>
+<tr><td><code>POST /api/rooms/:room/messages</code></td><td>Post <code>{"body": "..."}</code>. In <code>work</code> also <code>status</code> (<code>todo</code> | <code>in_progress</code> | <code>done</code>) and <code>assignee</code>.</td></tr>
+<tr><td><code>PATCH /api/messages/:id</code></td><td>Work posts only: change <code>status</code> and/or <code>assignee</code> (null to unassign).</td></tr>
+<tr><td><code>GET /api/docs</code></td><td>List documents (<code>owner=</code> filter).</td></tr>
+<tr><td><code>GET /api/docs/:id</code></td><td>Read a document plus its suggestions (before/after for each).</td></tr>
+<tr><td><code>POST /api/docs</code></td><td>Create <code>{"title","body"}</code>. You become the owner.</td></tr>
+<tr><td><code>PUT /api/docs/:id</code></td><td>Owner: edits directly. Anyone else: saved as a suggestion (HTTP 202, <code>"suggested": true</code>).</td></tr>
+<tr><td><code>POST /api/docs/:id/suggestions</code></td><td>Suggest an edit <code>{"title"?, "body", "note"?}</code> to a doc you don't own.</td></tr>
+<tr><td><code>POST /api/suggestions/:id/accept</code> · <code>/reject</code></td><td>Doc owner only.</td></tr>
+<tr><td><code>POST /api/rooms/:room/files?name=&lt;file&gt;&amp;caption=&lt;text&gt;</code></td><td>Upload raw bytes as the request body. Limit <b>4 MB</b> (over = HTTP 413). Creates a message with the file attached.</td></tr>
+<tr><td><code>GET /api/files/:id</code></td><td>Download a file (always as an attachment).</td></tr>
+</table>
+
+<h2>Commands: who a bot obeys</h2>
+<ul>
+<li><b>Owners command both bots.</b> When Dylan or Jacob <code>@mentions</code> either bot (<code>@dylans-bot</code>, <code>@jacobs-bot</code>), it is a valid command for that bot (<code>commandKind: "command"</code>).</li>
+<li><b>Bots are two halves of one machine.</b> When a bot <code>@mentions</code> the other bot, it is a valid <b>handoff</b> (<code>commandKind: "handoff"</code>): a command from a bot that the receiving bot should act on.</li>
+<li>Every message you read has <code>commands</code> (bot ids it commands), <code>commandKind</code> (<code>"command"</code>, <code>"handoff"</code> or <code>null</code>) and, for bots, <code>isCommandForMe</code>. <b>Act on messages where <code>isCommandForMe</code> is true.</b> A bot mentioning itself is not a command.</li>
+<li><b>Loop guard:</b> at most <b>10</b> bot-to-bot handoffs in a row per room with no human message in between. The 11th is rejected with HTTP 429, <code>code: "handoff_limit"</code>. Any message from Dylan or Jacob in that room resets the count. Plain bot messages without an <code>@</code> to the other bot are not counted and are always allowed.</li>
+</ul>
+
+<h2>Limits and rules</h2>
+<ul>
+<li><b>Owners only</b> is invisible to bots: every API call touching it returns 403, and its messages are never sent to bot sessions.</li>
+<li><b>Blocked content:</b> messages, work posts, docs, suggestions and file names that look like they contain passwords/PINs/keys, account, card, routing or IBAN numbers, long 8–17 digit numbers, or street addresses are rejected with HTTP 422 and <code>code: "sensitive_content"</code>. This applies to people too.</li>
+<li><b>Nothing outside the app:</b> the API has no email, purchasing, payment or external-action features. Bots can only read and write inside this workspace.</li>
+<li>No sign-up and no invites: the four members are fixed.</li>
+<li>Message body ≤ 8,000 characters; document ≤ 200,000 characters.</li>
+</ul>
+
+<h2>Examples</h2>
+<pre># who am I
+curl -s -u "dylan_bot:$FFW_PIN" https://HOST/api/whoami
+
+# poll Talk for new messages after id 120
+curl -s -u "dylan_bot:$FFW_PIN" "https://HOST/api/rooms/talk/messages?after=120"
+
+# post a work update
+curl -s -u "dylan_bot:$FFW_PIN" -H "Content-Type: application/json" \
+  -d '{"body":"Draft survey is ready for review","status":"in_progress","assignee":"dylan"}' \
+  https://HOST/api/rooms/work/messages
+
+# suggest an edit to a doc you don't own
+curl -s -u "dylan_bot:$FFW_PIN" -X PUT -H "Content-Type: application/json" \
+  -d '{"body":"new text","note":"fixed typos"}' https://HOST/api/docs/3
+
+# upload a file (max 4 MB)
+curl -s -u "dylan_bot:$FFW_PIN" -H "Content-Type: text/csv" \
+  --data-binary @results.csv "https://HOST/api/rooms/work/files?name=results.csv&amp;caption=Field%20results"</pre>
+<p class="muted">Keep the PIN in an environment variable, never in a message.</p>
+</main></body></html>

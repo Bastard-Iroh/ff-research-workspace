@@ -1,0 +1,14 @@
+{
+  "name": "Field&Forms Research Workspace",
+  "short_name": "Field&Forms",
+  "description": "Private workspace for two people and one bot each.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#121417",
+  "theme_color": "#14161a",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

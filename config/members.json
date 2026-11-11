@@ -1,0 +1,16 @@
+{
+  "dylan": {
+    "name": "Dylan"
+  },
+  "jacob": {
+    "name": "Jacob"
+  },
+  "dylan_bot": {
+    "name": "Dylan's Bot",
+    "handle": "dylans-bot"
+  },
+  "jacob_bot": {
+    "name": "Jacob's Bot",
+    "handle": "jacobs-bot"
+  }
+}
